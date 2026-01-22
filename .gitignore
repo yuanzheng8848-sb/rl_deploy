@@ -1,0 +1,47 @@
+# ----------------------------
+# Personal / editor / misc
+# ----------------------------
+record_data*
+1.md
+.vscode
+rl_deploy_2
+rl_deploy_backup
+*.pkl
+
+# ----------------------------
+# Python bytecode
+# ----------------------------
+__pycache__/
+*.py[cod]
+
+# ----------------------------
+# Build artifacts (C/C++)
+# ----------------------------
+build/
+**/build/
+**/packagecache/
+
+# ----------------------------
+# Python packaging
+# ----------------------------
+*.egg-info/
+**/*.egg-info/
+
+# ----------------------------
+# ML / RL artifacts
+# ----------------------------
+wandb/
+runs/
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.npz
+
+# ----------------------------
+# ROS / robotics
+# ----------------------------
+devel/
+install/
+log/

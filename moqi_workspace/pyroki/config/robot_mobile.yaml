@@ -1,0 +1,31 @@
+description:
+  package_path: ../thirdparty/app_robot_descriptions
+  urdf_relative_path: app_robot_description/urdf/export/app_robot_upper_body_mobile_v3_swt.urdf
+  end_effector_link_names: 
+    - dummy_left_end_effector
+    - dummy_right_end_effector
+chest:
+  tracking: true
+  link_name: body_chest_link
+collision:
+  disabled_pairs:
+    enable: true
+    srdf_relative_path: app_robot_description/urdf/self_collision/app_robot_upper_body_mobile_v3_swt.srdf
+  sphere_and_capsule_only: true
+  world:
+    enable: true
+    desktop:
+      enable: true
+      height_offset: 0.01
+    side_walls:
+      enable: true
+      side_offset: 0.6
+elbow_angle:
+  tracking: false
+  shoulder_offset: [0.0, 0.0, 0.1625]
+  target: 
+    left: -40
+    right: 40
+  link_names:
+    left: ["left_arm_base_link", "left_link4", "left_link6"]
+    right: ["right_arm_base_link", "right_link4", "right_link6"]

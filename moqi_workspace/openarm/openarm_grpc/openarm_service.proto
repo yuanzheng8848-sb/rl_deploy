@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package openarm;
+
+// 位置信息
+message Position {
+    repeated double arm_positions = 1;
+    repeated double gripper_positions = 2;
+}
+
+// 设置位置的请求
+message SetPositionRequest {
+    repeated double arm_target_positions = 1;
+    double gripper_target_position = 2;
+    repeated double current_arm_positions = 3;
+    double current_gripper_position = 4;
+    string arm_side = 5;  // "left" or "right"
+}
+
+// 设置位置的响应
+message SetPositionResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// 获取位置的请求
+message GetPositionRequest {
+    string arm_side = 1;  // "left" or "right"
+}
+
+// 获取位置的响应
+message GetPositionResponse {
+    bool success = 1;
+    string message = 2;
+    repeated double arm_positions = 3;
+    repeated double gripper_positions = 4;
+}
+
+// 初始化请求
+message InitializeRequest {
+    bool enable_left = 1;
+    bool enable_right = 2;
+}
+
+// 初始化响应
+message InitializeResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// 测试运行请求
+message TestRunRequest {
+    // 空消息，测试运行不需要参数
+}
+
+// 测试运行响应
+message TestRunResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// OpenArm gRPC 服务定义
+service OpenArmService {
+    // 初始化控制器
+    rpc Initialize(InitializeRequest) returns (InitializeResponse);
+    
+    // 获取左臂位置
+    rpc GetLeftPosition(GetPositionRequest) returns (GetPositionResponse);
+    
+    // 设置左臂位置
+    rpc SetLeftPosition(SetPositionRequest) returns (SetPositionResponse);
+    
+    // 获取右臂位置
+    rpc GetRightPosition(GetPositionRequest) returns (GetPositionResponse);
+    
+    // 设置右臂位置
+    rpc SetRightPosition(SetPositionRequest) returns (SetPositionResponse);
+    
+    // 测试运行
+    rpc TestRun(TestRunRequest) returns (TestRunResponse);
+}
