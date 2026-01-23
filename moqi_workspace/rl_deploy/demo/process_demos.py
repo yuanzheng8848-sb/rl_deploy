@@ -4,21 +4,20 @@ import numpy as np
 from pathlib import Path
 import shutil
 import cv2
+from scipy.spatial.transform import Rotation as R
 
-def process_demos(source_dir, dest_dir):
+def process_demos(source_dir, dest_file):
     """
     Reads .pkl files from source_dir, filters out idle frames,
-    and saves them to dest_dir.
+    merges them, and saves to a single dest_file.
     """
     source_path = Path(source_dir)
-    dest_path = Path(dest_dir)
+    dest_path = Path(dest_file)
     
     if not source_path.exists():
         print(f"Source directory {source_path} does not exist.")
         return
 
-    # Create destination directory if it doesn't exist
-    dest_path.mkdir(parents=True, exist_ok=True)
     print(f"Processing demos from {source_path} to {dest_path}")
 
     # Thresholds for "idle" detection
@@ -27,10 +26,13 @@ def process_demos(source_dir, dest_dir):
     GRIPPER_THRESH = 0.01 # Gripper command change threshold
 
     files = list(source_path.glob("*.pkl"))
+    files.sort() # Ensure deterministic order
     print(f"Found {len(files)} files.")
 
     total_original_frames = 0
     total_kept_frames = 0
+    
+    all_transitions = []
 
     for file_path in files:
         try:
@@ -44,11 +46,6 @@ def process_demos(source_dir, dest_dir):
             original_len = len(transitions)
             kept_transitions = []
             
-            # Always keep the last 10 frames
-            # But we process from the start to filter the beginning/middle
-            
-            from scipy.spatial.transform import Rotation as R
-
             prev_obs_pose = None
             prev_target_pos = None
             prev_gripper_cmd = None
@@ -62,22 +59,12 @@ def process_demos(source_dir, dest_dir):
                 # Parse Obs
                 obs_state = t['observations']['state'] # [x,y,z,qx,qy,qz,qw, grip]
                 obs_pos = obs_state[:3]
-                obs_quat = obs_state[3:7] # [qx,qy,qz,qw] - check order in record_demo_rl.py
-                # record_demo_rl.py: obs_right_ee is [x,y,z,qx,qy,qz,qw]
-                # scipy expects [x,y,z,w] usually, but let's check.
-                # record_demo_rl.py: to_xyzquat puts w last -> [x,y,z,w]
-                # Wait, record_demo_rl.py line 659: np.concatenate([p[4:], p[1:4], [p[0]]])
-                # p is [qw, qx, qy, qz, x, y, z]
-                # p[4:] is [x,y,z]
-                # p[1:4] is [qx,qy,qz]
-                # p[0] is qw
-                # So obs_state is [x,y,z, qx,qy,qz,qw].
-                # scipy R.from_quat expects [x,y,z,w]. So this matches.
+                obs_quat = obs_state[3:7] # [qx,qy,qz,qw]
                 
                 # Parse Action
                 action = t['actions']
                 delta_pos_body = action[:3]
-                delta_euler = action[3:6]
+                # delta_euler = action[3:6]
                 gripper_cmd = action[6]
 
                 # Reconstruct Target Pos (World)
@@ -110,18 +97,10 @@ def process_demos(source_dir, dest_dir):
                     prev_obs_pose = obs_state
                     prev_target_pos = target_pos
                     prev_gripper_cmd = gripper_cmd
-                
-                # Debug stats for first few frames
-                # if i < 5:
-                #     print(f"Frame {i}: Active={is_active}")
             
-            # Calculate stats for this file
-            print(f"  Stats: Kept {len(kept_transitions)}/{original_len}")
-
             # Post-processing: Resize images and Pad state
-            import cv2
             
-            final_transitions = []
+            file_transitions = []
             for t in kept_transitions:
                 new_t = t.copy()
                 
@@ -158,33 +137,36 @@ def process_demos(source_dir, dest_dir):
                     new_t['next_observations']['state'] = pad_state(new_t['next_observations']['state'])
                 
                 new_t['observations'] = new_obs
-                final_transitions.append(new_t)
+                file_transitions.append(new_t)
 
-            # Save processed file
-            new_len = len(final_transitions)
+            # Append to main list
+            new_len = len(file_transitions)
             total_original_frames += original_len
             total_kept_frames += new_len
-            
-            dest_file_path = dest_path / file_path.name
-            with open(dest_file_path, "wb") as f:
-                pkl.dump(final_transitions, f)
+            all_transitions.extend(file_transitions)
             
             print(f"Processed {file_path.name}: {original_len} -> {new_len} frames ({new_len/original_len:.1%})")
 
         except Exception as e:
             print(f"Error processing {file_path.name}: {e}")
 
+    # Save merged file
     print("-" * 40)
     print(f"Total Frames: {total_original_frames} -> {total_kept_frames}")
     if total_original_frames > 0:
         print(f"Overall Reduction: {total_kept_frames/total_original_frames:.1%}")
-    print(f"Processed files saved to {dest_path}")
+    
+    with open(dest_path, "wb") as f:
+        pkl.dump(all_transitions, f)
+    
+    print(f"Merged demos saved to {dest_path}")
 
 if __name__ == "__main__":
     # Define paths relative to this script
     current_dir = Path(__file__).parent
-    # moqi_workspace/rl_deploy -> moqi_workspace/bc_demos
-    source_dir = current_dir.parent / "bc_demos"
-    dest_dir = current_dir.parent / "bc_demos_processed"
+    # Source: demos_origin in current directory
+    source_dir = current_dir / "demos_origin"
+    # Dest: merged_demos.pkl in current directory
+    dest_file = current_dir / "merged_demos.pkl"
     
-    process_demos(source_dir, dest_dir)
+    process_demos(source_dir, dest_file)

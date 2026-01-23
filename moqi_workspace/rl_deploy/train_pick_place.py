@@ -364,7 +364,7 @@ flags.DEFINE_boolean("render", False, "是否渲染环境")
 flags.DEFINE_string("ip", "localhost", "Learner 的 IP 地址")
 # "small" 是 4 层卷积网络，"resnet" 和 "mobilenet" 是冻结权重的预训练网络
 flags.DEFINE_string("encoder_type", "resnet-pretrained", "编码器类型")
-flags.DEFINE_string("demo_path", "./rl_success_demos.pkl", "演示数据路径")
+flags.DEFINE_string("demo_path", "demo/merged_demos.pkl", "演示数据路径")
 flags.DEFINE_integer("checkpoint_period", 1000, "保存 Checkpoint 的周期")
 flags.DEFINE_string("checkpoint_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy_2/checkpoints", "保存 Checkpoint 的路径")
 flags.DEFINE_string(

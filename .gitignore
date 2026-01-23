@@ -7,6 +7,8 @@ record_data*
 rl_deploy_2
 rl_deploy_backup
 *.pkl
+recording*
+*ckpt*
 
 # ----------------------------
 # Python bytecode
