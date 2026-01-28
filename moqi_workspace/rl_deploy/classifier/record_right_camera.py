@@ -7,7 +7,7 @@ from datetime import datetime
 
 # Add pyroki to path
 current_dir = Path(__file__).parent
-pyroki_path = current_dir.parent / "pyroki"
+pyroki_path = current_dir.parent.parent / "pyroki"
 sys.path.append(str(pyroki_path))
 
 try:
@@ -21,7 +21,7 @@ def main():
     CAMERA_ID = "236422072385" # Right camera
     WIDTH = 640
     HEIGHT = 480
-    FPS = 30
+    FPS = 30 # Realsense usually requires 15, 30, or 60. 5 is not supported.
     
     # Create recording directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

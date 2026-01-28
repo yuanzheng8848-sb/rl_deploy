@@ -21,11 +21,11 @@ import gym
 from gym import spaces
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string("checkpoint_path", "../classifier_ckpt_cam1", "Path to save checkpoint")
+flags.DEFINE_string("checkpoint_path", "./classifier_ckpt", "Path to save checkpoint")
 flags.DEFINE_integer("batch_size", 64, "Batch size")
 flags.DEFINE_integer("num_epochs", 100, "Number of epochs")
 
-RECORD_DATA_DIR = "/home/sj/Desktop/zy/moqi_workspace/record_data"
+RECORD_DATA_DIR = "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/demo/record_data"
 
 
 def populate_data_store_from_images(data_store, images):
@@ -95,47 +95,89 @@ def main(_):
     failure_images = []
     
     if not os.path.exists(RECORD_DATA_DIR):
-        raise FileNotFoundError(f"Record data dir not found: {RECORD_DATA_DIR}")
+        print(f"Warning: Record data dir not found: {RECORD_DATA_DIR}")
+    else:
+        sessions = sorted([d for d in os.listdir(RECORD_DATA_DIR) if os.path.isdir(os.path.join(RECORD_DATA_DIR, d))])
+        
+        print(f"Found {len(sessions)} sessions in {RECORD_DATA_DIR}")
 
-    sessions = sorted([d for d in os.listdir(RECORD_DATA_DIR) if os.path.isdir(os.path.join(RECORD_DATA_DIR, d))])
+        for session in sessions:
+            if session in ["success", "failure"]:
+                continue
+                
+            img_dir = os.path.join(RECORD_DATA_DIR, session, "images", "cam_1_rgb")
+            if not os.path.exists(img_dir):
+                continue
+                
+            # Manually glob and sort to ensure order
+            image_paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg"))) 
+            # Add other extensions if needed, but ensure sorting is correct across them if mixed
+            # For now assuming primarily jpg based on file listing check
+
+            current_session_images = []
+            for path in image_paths:
+                try:
+                    img = cv2.imread(path)
+                    if img is None:
+                        continue
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = cv2.resize(img, (128, 128))
+                    img = img[None, ...] 
+                    current_session_images.append(img)
+                except Exception as e:
+                    print(f"Error loading {path}: {e}")
+
+            if len(current_session_images) < 20:
+                 print(f"Warning: Session {session} has fewer than 20 images ({len(current_session_images)}). Skipping.")
+                 continue
+            
+            # First 30 frames -> failure
+            failure_images.extend(current_session_images[:30])
+            # Last 30 frames -> success
+            success_images.extend(current_session_images[-30:])
+            
+    # --- Load Extra Images (Success & Failure) ---
+    extra_img_dir = "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/extra_images"
     
-    print(f"Found {len(sessions)} sessions in {RECORD_DATA_DIR}")
-
-    for session in sessions:
-        if session in ["success", "failure"]:
-            continue
-            
-        img_dir = os.path.join(RECORD_DATA_DIR, session, "images", "cam_1_rgb")
-        if not os.path.exists(img_dir):
-            continue
-            
-        # Manually glob and sort to ensure order
-        image_paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg"))) 
-        # Add other extensions if needed, but ensure sorting is correct across them if mixed
-        # For now assuming primarily jpg based on file listing check
-
-        current_session_images = []
-        for path in image_paths:
+    if os.path.exists(extra_img_dir):
+        print(f"Loading extra images from {extra_img_dir}...")
+        
+        # 1. Extra Success Images
+        success_img_paths = sorted(glob.glob(os.path.join(extra_img_dir, "success", "**", "*.jpg"), recursive=True))
+        count_success = 0
+        for path in success_img_paths:
             try:
                 img = cv2.imread(path)
-                if img is None:
-                    continue
+                if img is None: continue
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = cv2.resize(img, (128, 128))
-                img = img[None, ...] 
-                current_session_images.append(img)
+                img = img[None, ...]
+                success_images.append(img)
+                count_success += 1
             except Exception as e:
-                print(f"Error loading {path}: {e}")
+                print(f"Error loading extra success image {path}: {e}")
+                
+        # 2. Extra Failure Images
+        failure_img_paths = sorted(glob.glob(os.path.join(extra_img_dir, "failure", "**", "*.jpg"), recursive=True))
+        count_failure = 0
+        for path in failure_img_paths:
+            try:
+                img = cv2.imread(path)
+                if img is None: continue
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (128, 128))
+                img = img[None, ...]
+                failure_images.append(img)
+                count_failure += 1
+            except Exception as e:
+                print(f"Error loading extra failure image {path}: {e}")
+                
+        print(f"Added {count_success} extra SUCCESS images.")
+        print(f"Added {count_failure} extra FAILURE images.")
 
-        if len(current_session_images) < 20:
-             print(f"Warning: Session {session} has fewer than 20 images ({len(current_session_images)}). Skipping.")
-             continue
-        
-        # First 30 frames -> failure
-        failure_images.extend(current_session_images[:30])
-        # Last 30 frames -> success
-        success_images.extend(current_session_images[-30:])
-        
+    else:
+        print(f"Extra images directory not found: {extra_img_dir}")
+
     print(f"Total Success Images: {len(success_images)}")
     print(f"Total Failure Images: {len(failure_images)}")
 

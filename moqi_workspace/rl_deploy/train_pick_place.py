@@ -71,28 +71,45 @@ try:
 except ImportError as e:
     print(f"Failed to import camera modules: {e}")
 
-from openarm_env import OpenArmEnv, TrainConfig
+from openarm_env import OpenArmEnv, DefaultOpenArmConfig
 
 class LocalOpenArmEnv(OpenArmEnv):
     """
     Subclass of OpenArmEnv that initializes and reads from local cameras
     instead of relying on the server to send images.
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # OpenArmEnv.__init__ returns early if fake_env=True, skipping camera init.
+        # We enforce camera initialization here for LocalOpenArmEnv to support Mock Cameras.
+        if self.fake_env:
+             print("[LocalOpenArmEnv] Enforcing local camera init for FAKE/MOCK mode.")
+             self.init_cameras(None)
+
     def init_cameras(self, config):
         self.cameras = []
         # Configuration from main_v5_record_velocity.py
         # Left: 150622074105, Right: 236422072385
         # Head: /dev/video18
         
+        # Import MockCamera if needed
+        try:
+             from mock_hardware import MockCamera
+        except ImportError:
+             MockCamera = None
+
         # 1. Left Camera
         try:
-            cam_left = RealsenseCamera(
-                device_id="150622074105",
-                enable_depth=False,
-                width=640,
-                height=480,
-                fps=30
-            )
+            if self.fake_env:
+                cam_left = MockCamera(width=640, height=480, fps=30)
+            else:
+                cam_left = RealsenseCamera(
+                    device_id="150622074105",
+                    enable_depth=False,
+                    width=640,
+                    height=480,
+                    fps=30
+                )
             self.cameras.append(("image_left", cam_left))
             print("Initialized Left Camera (150622074105)")
         except Exception as e:
@@ -100,13 +117,16 @@ class LocalOpenArmEnv(OpenArmEnv):
 
         # 2. Right Camera
         try:
-            cam_right = RealsenseCamera(
-                device_id="236422072385",
-                enable_depth=False,
-                width=640,
-                height=480,
-                fps=30
-            )
+            if self.fake_env:
+                cam_right = MockCamera(width=640, height=480, fps=30)
+            else:
+                cam_right = RealsenseCamera(
+                    device_id="236422072385",
+                    enable_depth=False,
+                    width=640,
+                    height=480,
+                    fps=30
+                )
             self.cameras.append(("image_right", cam_right))
             print("Initialized Right Camera (236422072385)")
         except Exception as e:
@@ -115,9 +135,12 @@ class LocalOpenArmEnv(OpenArmEnv):
         # 3. Head Camera (Primary)
         try:
             # Note: Exposure 150 as in reference
-            cam_head = OpenCVCamera("/dev/video18", width=1280, height=960, fps=30, exposure=150)
+            if self.fake_env:
+                cam_head = MockCamera(width=1280, height=960, fps=30)
+            else:
+                cam_head = OpenCVCamera("/dev/video12", width=1280, height=960, fps=30, exposure=150)
             self.cameras.append(("image_primary", cam_head))
-            print("Initialized Head Camera (/dev/video18)")
+            print("Initialized Head Camera (/dev/video12)")
         except Exception as e:
             print(f"Failed to init Head Camera: {e}")
 
@@ -236,6 +259,57 @@ class ClassifierRewardWrapper(gym.Wrapper):
             checkpoint_path=classifier_ckpt_path,
         )
         print("[RewardWrapper] Classifier loaded.")
+        
+        # --- Debug Image Capture Setup ---
+        self.last_capture_data = {"img": None, "prob": 0.0}
+        # Start keyboard listener thread
+        import threading
+        self.listener_thread = threading.Thread(target=self._input_loop, daemon=True)
+        self.listener_thread.start()
+        print("[RewardWrapper] Debug Keyboard Listener started. Press <Enter> or <Space+Enter> to save debug image.")
+
+    def _input_loop(self):
+        """Background thread to listen for keyboard input"""
+        while True:
+            try:
+                # Blocking input
+                user_input = input()
+                # If input is empty (Enter) or contains space
+                if user_input == "" or " " in user_input:
+                    self.save_debug_image()
+            except EOFError:
+                break
+            except Exception:
+                pass
+
+    def save_debug_image(self):
+        """Save the latest classification image"""
+        data = self.last_capture_data
+        img = data["img"]
+        prob = data["prob"]
+        
+        if img is None:
+            print("[DebugCapture] No image available to save.")
+            return
+
+        import os
+        import datetime
+        import cv2 # Ensure cv2 is available (already imported in file)
+        
+        save_dir = "./classifier/debug_image"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_reward_{prob:.4f}.png"
+        filepath = os.path.join(save_dir, filename)
+        
+        try:
+            # Img is RGB (from LocalOpenArmEnv logic), cv2.imwrite expects BGR
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(filepath, img_bgr)
+            print(f"[DebugCapture] Saved: {filepath}")
+        except Exception as e:
+            print(f"[DebugCapture] Save failed: {e}")
 
     def step(self, action):
         obs, rew, done, truncated, info = self.env.step(action)
@@ -267,23 +341,137 @@ class ClassifierRewardWrapper(gym.Wrapper):
             logits = self.classifier_func(classifier_input)
             prob = nn.sigmoid(logits).item()
             
+            # Store for debug capture
+            self.last_capture_data = {"img": raw_img, "prob": prob}
+            
             # Reward Logic
-            # User Request: prob > 0.9 -> reward = 1.0, prob > 0.95 -> done = True
-            if prob > 0.5:
-                reward = 1.0
-                if prob > 0.5:
-                    done = True
-                    print(f"[Reward] Success! Prob: {prob:.4f} (Terminated)")
-                else:
-                    print(f"[Reward] Good State! Prob: {prob:.4f} (Continuing)")
-            else:
-                reward = 0.0
+            # User Request: Continuous Reward (prob) and Success > 0.95
+            reward = prob # Continuous reward [0, 1]
+            
+            if prob > 0.95:
+                # --- Success Animation ---
+                print(f"[Reward] Success detected (Prob: {prob:.4f}). Triggering gripper animation.")
+                
+                # Create a local action array to override gripper while stopping arm
+                # Assuming 'action' passed to step() is valid shape
+                anim_action = np.zeros_like(action)
+                
+                # --- Step 1: Move Forward 3cm ---
+                # Assume max speed 1cm/step (SCALE_POS=0.01), so 3 steps of 1.0
+                # Assume Single Arm (Right) or Active Arm is indices 0-6
+                # If Dual Arm, we might need to adjust, but based on config 'arm="right"', it is 7-dim.
+                
+                move_action = np.zeros_like(action)
+                # Move forward in X (index 0)
+                move_action[0] = 1.0 
+                
+                # Keep gripper open (-0.9) during move
+                target_val_open = -0.9
+                if move_action.shape[0] >= 14:
+                    move_action[6] = target_val_open
+                    move_action[13] = target_val_open
+                elif move_action.shape[0] >= 7:
+                    move_action[6] = target_val_open
+                
+                print("[Reward] Animation: Moving Forward 5cm (Closed-Loop)...")
+                
+                # --- Closed-Loop Control ---
+                try:
+                    base_env = self.env.unwrapped
+                    # Determine current arm index (Right=1 for 'both', 0 for 'right'?)
+                    # LocalOpenArmEnv uses self.arm to manage indices.
+                    # If arm="right", currpos shape is still (2, 7) in OpenArmEnv logic.
+                    # Index 1 is Right.
+                    arm_idx = 1 if base_env.arm in ["both", "right"] else 0
+                    if base_env.arm == "left": arm_idx = 0 
+                    
+                    start_x = base_env.currpos[arm_idx, 0]
+                    target_x = start_x + 0.05 # Target: +5cm
+                    
+                    print(f"[Reward] Start X: {start_x:.4f}, Target X: {target_x:.4f}")
+                    
+                    max_steps = 14 # Timeout ~2s at 7Hz
+                    steps = 0
+                    
+                    while steps < max_steps:
+                        curr_x = base_env.currpos[arm_idx, 0]
+                        error = target_x - curr_x
+                        
+                        if error <= 0.02: # 2cm tolerance
+                            print(f"[Reward] Reached Target! Curr X: {curr_x:.4f}, Error: {error:.4f}")
+                            break
+                            
+                        # Step environment
+                        obs, rew, done, truncated, info = self.env.step(move_action)
+                        steps += 1
+                        
+                        if steps % 10 == 0:
+                            print(f"[Reward] Moving... Curr X: {curr_x:.4f}, Dist: {error:.4f}")
+                            
+                    if steps >= max_steps:
+                        print("[Reward] Warning: Move Timeout (Max Steps Reached)")
+                        
+                except Exception as e:
+                    print(f"[Reward] Closed-Loop Error: {e}. Fallback to open-loop 5 steps.")
+                    for _ in range(5):
+                         obs, rew, done, truncated, info = self.env.step(move_action)
+
+                # --- Step 2: Close Gripper to 30% ---
+                # Hold for 3 seconds (21 steps at 7Hz)
+                target_val_close = 0.4
+                
+                close_action = np.zeros_like(action) # Zero velocity
+                if close_action.shape[0] >= 14: # Dual arm
+                    close_action[6] = target_val_close
+                    close_action[13] = target_val_close
+                elif close_action.shape[0] >= 7: # Single arm
+                    close_action[6] = target_val_close
+                
+                print("[Reward] Animation: Closing gripper (30% open) & Holding 3s...")
+                for _ in range(21):
+                    self.env.step(close_action)
+
+                # --- Step 3: Open Gripper back to original ---
+                # Hold for ~1 second (7 steps) to ensure opening
+                
+                open_action = np.zeros_like(action)
+                if open_action.shape[0] >= 14:
+                    open_action[6] = target_val_open
+                    open_action[13] = target_val_open
+                elif open_action.shape[0] >= 7:
+                    open_action[6] = target_val_open
+                
+                print("[Reward] Animation: Opening gripper...")
+                for _ in range(7):
+                    # Update 'obs' on the last step so returned 'obs' is fresh
+                    obs, rew, done, truncated, info = self.env.step(open_action)
+                
+                # -------------------------
+                
+                done = True
+                print(f"[Reward] Success! Prob: {prob:.4f} (Terminated)")
+            elif prob > 0.5:
+                print(f"[Reward] Good State! Prob: {prob:.4f} (Continuing)")
             
             info["classifier_prob"] = prob
-            info["success"] = (reward == 1.0)
+            info["success"] = (prob > 0.95)
+
+            # Visualization
+            if FLAGS.render:
+                # Convert RGB to BGR for OpenCV
+                show_img = cv2.cvtColor(raw_img, cv2.COLOR_RGB2BGR)
+                # Text: Reward and Prob
+                text = f"P: {prob:.3f} R: {reward}"
+                color = (0, 255, 0) if reward > 0.5 else (0, 0, 255)
+                cv2.putText(show_img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                cv2.imshow("Reward Classifier", show_img)
+                cv2.waitKey(1)
             
-            # Update info['success'] for done condition
-            if done and prob > 0.95:
+            # Update info for logs
+            # Update info for logs
+            info["classifier_prob"] = prob
+            
+            if done: 
                  info["success"] = True
             else:
                  info["success"] = False
@@ -294,6 +482,8 @@ class ClassifierRewardWrapper(gym.Wrapper):
             print(f"[RewardWrapper] Warning: Raw image '{self.reward_image_key}' not found in latest_images.")
             reward = 0.0
             info["classifier_prob"] = 0.0
+            # Reset capture data
+            self.last_capture_data = {"img": None, "prob": 0.0}
         
         return obs, reward, done, truncated, info
 
@@ -341,7 +531,7 @@ flags.DEFINE_string("env", "OpenArmEnv", "环境名称")
 flags.DEFINE_string("arm", "right", "控制哪个机械臂: 'left', 'right', 或 'both'")
 flags.DEFINE_string("agent", "drq", "Agent 名称")
 flags.DEFINE_string("exp_name", "forward_reach_10cm", "实验名称，用于 wandb 日志")
-flags.DEFINE_integer("max_traj_length", 25, "最大轨迹长度")
+flags.DEFINE_integer("max_traj_length", 75, "最大轨迹长度")
 flags.DEFINE_integer("seed", 42, "随机种子")
 flags.DEFINE_bool("save_model", False, "是否保存模型")
 flags.DEFINE_integer("critic_actor_ratio", 4, "Critic 与 Actor 的更新比例 (Critic 更新次数 / Actor 更新次数)")
@@ -359,16 +549,17 @@ flags.DEFINE_integer("eval_period", 2000, "评估周期")
 
 # 标志位：指示当前进程是 Learner 还是 Actor
 flags.DEFINE_boolean("learner", False, "是 Learner 还是 Trainer")
+flags.DEFINE_boolean("render", False, "Enable visualization of camera feed and reward")
 flags.DEFINE_boolean("actor", False, "是 Learner 还是 Trainer")
-flags.DEFINE_boolean("render", False, "是否渲染环境")
+
 flags.DEFINE_string("ip", "localhost", "Learner 的 IP 地址")
 # "small" 是 4 层卷积网络，"resnet" 和 "mobilenet" 是冻结权重的预训练网络
 flags.DEFINE_string("encoder_type", "resnet-pretrained", "编码器类型")
 flags.DEFINE_string("demo_path", "demo/merged_demos.pkl", "演示数据路径")
 flags.DEFINE_integer("checkpoint_period", 1000, "保存 Checkpoint 的周期")
-flags.DEFINE_string("checkpoint_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy_2/checkpoints", "保存 Checkpoint 的路径")
+flags.DEFINE_string("checkpoint_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/checkpoints", "保存 Checkpoint 的路径")
 flags.DEFINE_string(
-    "reward_classifier_ckpt_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy_2/classifier_ckpt_cam1", "Path to reward classifier ckpt for cam1."
+    "reward_classifier_ckpt_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/classifier_ckpt", "Path to reward classifier ckpt for cam1."
 )
 
 flags.DEFINE_integer(
@@ -784,7 +975,7 @@ def main(_):
         arm="right",
         hz=7, # <--- 修改控制频率 (HZ)
         config=TrainConfig(),
-        fixed_target_pose=fixed_target_pose,
+
         max_episode_length=FLAGS.max_traj_length # Pass max_traj_length
     )
     
@@ -891,125 +1082,74 @@ def main(_):
                 raise FileNotFoundError(f"File {FLAGS.demo_path} not found")
 
             with open(FLAGS.demo_path, "rb") as f:
-                trajs = pkl.load(f)
-                for traj in trajs:
-                    traj_len = len(traj["actions"])
-                    for i in range(traj_len):
-                        # --- 适配 RelativeFrame 和 Quat2EulerWrapper ---
-                        # 1. 获取重置位姿 (轨迹的第一帧)
-                        # 假设 Demo 数据结构: state 是 (N, 16) 或类似
-                        # 我们需要提取 7 维位姿 (XYZ + Quat)
-                        
-                        # 辅助函数：从状态向量中获取位姿
-                        def get_pose(s, arm):
-                            if arm == "left": return s[:7]
-                            elif arm == "right": return s[8:15] # 8-14 是位姿 (7), 15 是夹爪
-                            return s[:7] # 默认
-                            
-                        def get_gripper(s, arm):
-                            if arm == "left": return s[7:8]
-                            elif arm == "right": return s[15:16]
-                            return s[7:8]
-                        
-                        # 获取该轨迹的初始位姿 (Reset Pose)
-                        reset_state_vec = traj["observations"]["state"][0]
-                        reset_pose_abs = get_pose(reset_state_vec, FLAGS.arm)
-                        
-                        # 计算 T_reset_inv
-                        T_reset = construct_homogeneous_matrix(reset_pose_abs)
-                        T_reset_inv = np.linalg.inv(T_reset)
-                        
-                        # 处理当前步
-                        curr_state_vec = traj["observations"]["state"][i]
-                        next_state_vec = traj["next_observations"]["state"][i]
-                        
-                        curr_pose_abs = get_pose(curr_state_vec, FLAGS.arm)
-                        next_pose_abs = get_pose(next_state_vec, FLAGS.arm)
-                        
-                        curr_gripper = get_gripper(curr_state_vec, FLAGS.arm)
-                        next_gripper = get_gripper(next_state_vec, FLAGS.arm)
-                        
-                        # 2. 计算相对位姿
-                        def to_relative(pose_abs, T_inv):
-                            T_curr = construct_homogeneous_matrix(pose_abs)
-                            T_rel = T_inv @ T_curr
-                            p_rel = T_rel[:3, 3]
-                            q_rel = R.from_matrix(T_rel[:3, :3]).as_quat()
-                            return np.concatenate([p_rel, q_rel])
-                            
-                        curr_pose_rel = to_relative(curr_pose_abs, T_reset_inv)
-                        next_pose_rel = to_relative(next_pose_abs, T_reset_inv)
-                        
-                        # 3. 转换为欧拉角 (Quat2EulerWrapper)
-                        def to_euler(pose_quat):
-                            xyz = pose_quat[:3]
-                            quat = pose_quat[3:]
-                            rpy = R.from_quat(quat).as_euler("xyz")
-                            return np.concatenate([xyz, rpy])
-                            
-                        curr_pose_euler = to_euler(curr_pose_rel) # (6,)
-                        next_pose_euler = to_euler(next_pose_rel) # (6,)
-                        
-                        # 4. 添加虚拟速度 (6,) - 因为环境可能需要速度输入
-                        vel = np.zeros((6,), dtype=np.float32)
-                        
-                        # 5. 构建最终状态字典
-                        # Env (SERLObsWrapper) sorts keys: gripper_pose(1), tcp_pose(6), tcp_vel(6)
-                        # So we must concatenate: [gripper, pose, vel]
-                        final_state = np.concatenate([curr_gripper, curr_pose_euler, vel]) # (13,)
-                        final_next_state = np.concatenate([next_gripper, next_pose_euler, vel]) # (13,)
-                        
-                        # 6. Action Normalization & Selection
-                        # Demo data from record_demo_rl.py is ALREADY in Body Frame (Physical Units).
-                        # Environment expects Normalized Actions in [-1, 1].
-                        # So we MUST Normalize: Physical / Scale = Normalized
-                        
-                        action = traj["actions"][i]
-                        if FLAGS.arm == "left":
-                            arm_action = action[:7]
-                        elif FLAGS.arm == "right":
-                            arm_action = action[7:]
-                        else:
-                            arm_action = action[:7] # default
-                            
-                        action_pos_physical = arm_action[:3]
-                        action_rot_physical = arm_action[3:6]
-                        gripper_physical = arm_action[6]
-                        
-                        # Scale Factors from DefaultOpenArmConfig
-                        SCALE_POS = 0.01
-                        SCALE_ROT = 0.05
-                        
-                        action_pos_norm = action_pos_physical / SCALE_POS
-                        action_rot_norm = action_rot_physical / SCALE_ROT
-                        
-                        # Gripper: val = 0.5236 * (norm - 1.0)  =>  norm = (val / 0.5236) + 1.0
-                        gripper_norm = (gripper_physical / 0.5236) + 1.0
-                        gripper_norm = np.clip(gripper_norm, -1.0, 1.0)
-                        
-                        final_action = np.concatenate([action_pos_norm, action_rot_norm, [gripper_norm]])
-                        
-                        # --- 奖励重塑 ---
-                        # 成功演示：最后 10 步为成功 (1.0)，其他为路径 (0.0)
-                        # 我们假设 rl_success_demos.pkl 仅包含成功演示
-                        is_success_step = i >= (traj_len - 10)
-                        reward_val = 1.0 if is_success_step else 0.0
-                        
-                        transition = {
-                            "observations": {
-                                "state": final_state,
-                                **{k: v[i] for k, v in traj["observations"].items() if k != "state"}
-                            },
-                            "next_observations": {
-                                "state": final_next_state,
-                                **{k: v[i] for k, v in traj["next_observations"].items() if k != "state"}
-                            },
-                            "actions": final_action,
-                            "rewards": np.array(reward_val, dtype=np.float32), # 覆盖奖励
-                            "masks": np.array(1.0, dtype=np.float32), # 确保 Mask 为 1.0
-                            "dones": traj["dones"][i],
-                        }
-                        demo_buffer.insert(transition)
+                transitions = pkl.load(f)
+
+                print(f"Loading {len(transitions)} transitions from {FLAGS.demo_path}...")
+
+                for i, t in enumerate(transitions):
+                    # --- 解析 Demo 数据 (Refer to process_demos.py) ---
+                    # New Format in PKL: State is ALREADY 13-dim Relative State
+                    # [Gripper(1), Euler(6), Vel(6)]
+                    
+                    obs_state = t['observations']['state']
+                    if t['next_observations'] is not None:
+                        next_obs_state = t['next_observations']['state']
+                        # Handle other keys if needed, but for now we focus on state
+                        next_obs_dict = {k: v for k, v in t["next_observations"].items() if k != "state"}
+                    else:
+                        # Terminal state: next_obs is None. Use current obs as placeholder.
+                        next_obs_state = obs_state
+                        next_obs_dict = {k: v for k, v in t["observations"].items() if k != "state"}
+
+                    # Verify shape if needed (defensive)
+                    if obs_state.shape[0] != 13:
+                        print(f"Warning: Demo state shape mismatch. Expected 13, got {obs_state.shape[0]}")
+                    
+                    final_state = obs_state
+                    final_next_state = next_obs_state
+                    
+                    # --- 4. 动作归一化 (Action Normalization) ---
+                    # Demo actions are Physical. Env expects [-1, 1].
+                    action_physical = t["actions"]
+                    
+                    # process_demos logic: action is [Pos(3), Rot(3), Grip(1)] (7,)
+                    action_pos_physical = action_physical[:3]
+                    action_rot_physical = action_physical[3:6]
+                    gripper_physical = action_physical[6]
+                    
+                    SCALE_POS = 0.01
+                    SCALE_ROT = 0.05
+                    
+                    # Normalize
+                    action_pos_norm = action_pos_physical / SCALE_POS
+                    action_rot_norm = action_rot_physical / SCALE_ROT
+                    
+                    # Gripper: val = 0.5236 * (norm - 1.0) => norm = (val / 0.5236) + 1.0
+                    gripper_norm = (gripper_physical / 0.5236) + 1.0
+                    gripper_norm = np.clip(gripper_norm, -1.0, 1.0)
+                    
+                    final_action = np.concatenate([action_pos_norm, action_rot_norm, [gripper_norm]])
+                    
+                    # --- 5. 奖励 (Rewards) ---
+                    # 使用 PKL 中已有的奖励，不重置
+                    reward_val = t['rewards']
+
+                    # Construct Transition
+                    transition = {
+                        "observations": {
+                            "state": final_state,
+                            **{k: v for k, v in t["observations"].items() if k != "state"}
+                        },
+                        "next_observations": {
+                            "state": final_next_state,
+                            **next_obs_dict
+                        },
+                        "actions": final_action,
+                        "rewards": np.array(reward_val, dtype=np.float32), 
+                        "masks": np.array(1.0, dtype=np.float32),
+                        "dones": t["dones"],
+                    }
+                    demo_buffer.insert(transition)
             print(f"demo buffer size: {len(demo_buffer)}")
         else:
             print("WARNING: No demo path provided. Demo buffer will be empty.")

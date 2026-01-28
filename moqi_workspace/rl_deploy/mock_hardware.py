@@ -51,3 +51,25 @@ class MockOpenArmController:
         else:
             self.right_q = np.array(target_positions)
         print("[Mock] Move complete.")
+
+class MockCamera:
+    """
+    Mock Camera that returns black (zero) images.
+    """
+    def __init__(self, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        print(f"[MockCamera] Initialized {width}x{height}@{fps}fps (Black Image Generator)")
+
+    def get_data(self, viz=False):
+        # Return black image (all zeros)
+        # RealsenseCamera usually returns [color, depth] (list)
+        # OpenCVCamera usually returns frame (ndarray)
+        # We will return [color, None] to mimic Realsense structure mostly, 
+        # or just color if caller handles it.
+        # LocalOpenArmEnv handles list or ndarray.
+        # Let's return a list [color, None] to be safe for Realsense logic.
+        
+        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        return [img, None]

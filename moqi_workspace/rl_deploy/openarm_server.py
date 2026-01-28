@@ -10,7 +10,7 @@ import cv2
 import base64
 
 # --- 配置 ---
-USE_MOCK = True  # Set to True to use Mock Hardware, False for Real Hardware
+USE_MOCK = False  # Set to True to use Mock Hardware, False for Real Hardware
 
 # --- 路径配置 ---
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -126,19 +126,35 @@ class OpenArmServer:
         """Initialize Realsense Cameras"""
         # Camera Configs
         self.cam_configs = {
-            "head": {"serial": "248622302807", "width": 1280, "height": 720, "fps": 30},
-            "left": {"serial": "150622074105", "width": 640, "height": 480, "fps": 30},
-            "right": {"serial": "236422072385", "width": 640, "height": 480, "fps": 30}
+            "head": {"type": "opencv", "device_id": "/dev/video12", "width": 1280, "height": 960, "fps": 30, "exposure": 150},
+            "left": {"type": "realsense", "serial": "150622074105", "width": 640, "height": 480, "fps": 30},
+            "right": {"type": "realsense", "serial": "236422072385", "width": 640, "height": 480, "fps": 30}
         }
         
         try:
             for name, cfg in self.cam_configs.items():
-                print(f"Initializing Camera {name} ({cfg['serial']})...")
-                cam = RealsenseCamera(device_id=cfg["serial"], width=cfg["width"], height=cfg["height"], fps=cfg["fps"], enable_depth=False)
+                print(f"Initializing Camera {name}...")
+                if cfg["type"] == "opencv":
+                     from connection.cameras import OpenCVCamera
+                     cam = OpenCVCamera(
+                        device_id=cfg["device_id"], 
+                        width=cfg["width"], 
+                        height=cfg["height"], 
+                        fps=cfg["fps"], 
+                        exposure=cfg.get("exposure", None)
+                     )
+                else:
+                    cam = RealsenseCamera(
+                        device_id=cfg["serial"], 
+                        width=cfg["width"], 
+                        height=cfg["height"], 
+                        fps=cfg["fps"], 
+                        enable_depth=False
+                    )
                 # cam.start() # Auto-started in __init__
                 self.cameras[name] = cam
                 self.latest_frames[name] = None
-            print("All cameras initialized.")
+                print(f"Initialized {name} camera.")
         except Exception as e:
             print(f"[Server Warning] Camera Init Failed: {e}")
 
@@ -188,6 +204,15 @@ class OpenArmServer:
 
         # 构造返回字典
         # controller 2.0 暂时没有直接返回速度和力矩，这里填 0 防止 Env 报错
+        response = {
+            "pose": pose.tolist(),
+            "q": q.tolist(),
+            "gripper_pos": gripper.tolist(),
+            "vel": [0.0] * 12,     # 笛卡尔速度
+            "dq": [0.0] * 14,      # 关节速度
+            "force": [0.0] * 6,
+            "torque": [0.0] * 6,
+        }
         
         # 更新可视化
         if self.viser:
@@ -205,16 +230,8 @@ class OpenArmServer:
                     except Exception as e:
                         print(f"[Server Error] Encode image {name} failed: {e}")
 
-        return {
-            "pose": pose.tolist(),
-            "q": q.tolist(),
-            "gripper_pos": gripper.tolist(),
-            "vel": [0.0] * 12,     # 笛卡尔速度
-            "dq": [0.0] * 14,      # 关节速度
-            "force": [0.0] * 6,
-            "torque": [0.0] * 6,
-            "images": encoded_images
-        }
+        response["images"] = encoded_images
+        return response
 
     def move_ik(self, target_pose_flat, duration=1, gripper_pos=None):
         """
