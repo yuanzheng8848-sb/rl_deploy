@@ -280,6 +280,7 @@ class ClassifierRewardWrapper(gym.Wrapper):
         super().__init__(env)
         self.reward_image_key = reward_image_key
         self.enable_animation = enable_animation
+        self.current_stage = "stage1"
         
         # Determine sampling rng
         rng = jax.random.PRNGKey(0)
@@ -306,14 +307,18 @@ class ClassifierRewardWrapper(gym.Wrapper):
 
         # Manual supervision flags.
         # Reward for learning is driven only by keyboard input:
-        # no input / ENTER => 0, SPACE => 1.
+        # SPACE => failure/reset, ENTER => success.
         self.manual_fail_requested = False
         self.manual_success_requested = False
         
         import threading
         self.listener_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
         self.listener_thread.start()
-        print("[RewardWrapper] Keyboard controls: <ENTER> fail/reset, <SPACE> success/reset.")
+        print("[RewardWrapper] Keyboard controls: <SPACE> fail/reset, <ENTER> success.")
+
+    def set_stage(self, stage_name):
+        self.current_stage = str(stage_name)
+        print(f"[RewardWrapper] Active training stage: {self.current_stage}")
 
     def _get_reward_images(self):
         raw_img = None
@@ -379,6 +384,7 @@ class ClassifierRewardWrapper(gym.Wrapper):
             "manual_success": manual_success,
             "manual_failure": manual_failure,
             "success": manual_success,
+            "active_stage": self.current_stage,
         }
         return np.asarray(reward, dtype=np.float32), manual_termination, info
 
@@ -405,6 +411,7 @@ class ClassifierRewardWrapper(gym.Wrapper):
                 color = (0, 255, 255)
             cv2.putText(show_img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             cv2.putText(show_img, status_text, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(show_img, f"Stage: {self.current_stage}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             cv2.imshow("Reward Monitor", show_img)
             cv2.waitKey(1)
 
@@ -431,19 +438,19 @@ class ClassifierRewardWrapper(gym.Wrapper):
         return dec_rgb, enc
 
     def _keyboard_listener(self):
-        """Background thread: ENTER marks failure, SPACE marks success."""
+        """Background thread: SPACE marks failure, ENTER marks success."""
         from pynput import keyboard
         
         def on_press(key):
             try:
-                if key == keyboard.Key.enter:
+                if key == keyboard.Key.space:
                     self.manual_fail_requested = True
                     self.manual_success_requested = False
-                    print("\n[RewardWrapper] ENTER pressed. Marking episode as failure and resetting.")
-                elif key == keyboard.Key.space:
+                    print(f"\n[RewardWrapper] SPACE pressed during {self.current_stage}. Marking failure.")
+                elif key == keyboard.Key.enter:
                     self.manual_success_requested = True
                     self.manual_fail_requested = False
-                    print("\n[RewardWrapper] SPACE pressed. Marking episode as success and resetting.")
+                    print(f"\n[RewardWrapper] ENTER pressed during {self.current_stage}. Marking success.")
             except Exception:
                 pass
         
@@ -487,6 +494,7 @@ class ClassifierRewardWrapper(gym.Wrapper):
                 color = (0, 255, 255)
             cv2.putText(show_img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             cv2.putText(show_img, status_text, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(show_img, f"Stage: {self.current_stage}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             cv2.imshow("Reward Monitor", show_img)
             cv2.waitKey(1)
         
@@ -496,6 +504,8 @@ class EvdevSpacemouseIntervention(gym.ActionWrapper):
     """
     Evdev-based 3D mouse intervention wrapper.
     Behavior is aligned with rl_deploy/test/3dx/test_3dx_operation.py.
+    Arm pose control still depends on intervention mode, but gripper state is
+    always driven by the 3D mouse gripper button and never by the policy output.
     """
 
     def __init__(
@@ -743,14 +753,30 @@ class EvdevSpacemouseIntervention(gym.ActionWrapper):
             return [0]
         return [1]
 
+    def _manual_gripper_action_value(self):
+        return 1.0 if self.button_state["gripper_close"] else -1.0
+
+    def _apply_manual_gripper_to_action(self, action):
+        action = np.asarray(action, dtype=np.float32).copy()
+        arm = getattr(self.env.unwrapped, "arm", "both")
+        manual_gripper = self._manual_gripper_action_value()
+
+        if arm == "both":
+            for arm_idx in self._get_active_arm_indices():
+                start = arm_idx * 7
+                if action.shape[0] >= start + 7:
+                    action[start + 6] = manual_gripper
+        else:
+            if action.shape[0] >= 7:
+                action[6] = manual_gripper
+        return action
+
     def _desired_gripper_cmds(self, action):
         base_env = self.env.unwrapped
         gripper_cmds = [float(x) for x in base_env.curr_gripper_pos]
-        arm = getattr(base_env, "arm", "both")
         for arm_idx in self._get_active_arm_indices():
-            arm_action = action if arm != "both" else action[arm_idx * 7 : (arm_idx + 1) * 7]
             gripper_cmds[arm_idx] = (
-                self.gripper_close_cmd if float(arm_action[6]) > 0.0 else self.gripper_open_cmd
+                self.gripper_close_cmd if self.button_state["gripper_close"] else self.gripper_open_cmd
             )
         return gripper_cmds
 
@@ -905,7 +931,7 @@ class EvdevSpacemouseIntervention(gym.ActionWrapper):
         return False
 
     def _build_intervene_action(self, policy_action):
-        base_action = np.asarray(policy_action, dtype=np.float32).copy()
+        base_action = self._apply_manual_gripper_to_action(policy_action)
         if base_action.shape[0] < 6:
             return base_action
 
@@ -918,10 +944,6 @@ class EvdevSpacemouseIntervention(gym.ActionWrapper):
         rz = self._apply_deadzone(np.clip(-self.axes["rz"] / self.rot_denom, -1.0, 1.0), self.rot_deadzone)
         base_action[:6] = np.array([dx, dy, dz, rx, ry, rz], dtype=np.float32)
 
-        if base_action.shape[0] >= 7:
-            # In intervention mode:
-            # - button2 press toggles close/open mode
-            base_action[6] = 1.0 if self.button_state["gripper_close"] else -1.0
         return self._transform_action_to_policy(base_action)
 
     def reset(self, **kwargs):
@@ -1042,7 +1064,8 @@ class EvdevSpacemouseIntervention(gym.ActionWrapper):
             self.env.unwrapped.refresh_obs()
             self._target_pose_ref = np.array(self.env.unwrapped.currpos, copy=True)
 
-        obs, rew, done, truncated, info = self.env.step(action)
+        chosen_action = self._apply_manual_gripper_to_action(action)
+        obs, rew, done, truncated, info = self.env.step(chosen_action)
         self._last_obs = obs
         self._prev_obs_for_transition = obs
         self._last_servo_mode = self._intervention_mode
@@ -1111,6 +1134,27 @@ flags.DEFINE_boolean(
 )
 flags.DEFINE_integer("checkpoint_period", 200, "保存 Checkpoint 的周期")
 flags.DEFINE_string("checkpoint_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/checkpoints", "保存 Checkpoint 的路径")
+flags.DEFINE_boolean("enable_two_stage_training", True, "启用两阶段训练：stage1 成功后切到 stage2。")
+flags.DEFINE_enum(
+    "training_stage",
+    "stage1",
+    ["stage1", "stage2"],
+    "Learner 模式下当前进程负责训练哪个阶段。",
+)
+flags.DEFINE_string(
+    "stage1_checkpoint_path",
+    "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/checkpoints",
+    "第一阶段 checkpoint 路径。",
+)
+flags.DEFINE_string(
+    "stage2_checkpoint_path",
+    "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/checkpoints_stage2",
+    "第二阶段 checkpoint 路径。",
+)
+flags.DEFINE_integer("stage1_port_number", 6678, "第一阶段 learner 端口。")
+flags.DEFINE_integer("stage1_broadcast_port", 6679, "第一阶段 learner 广播端口。")
+flags.DEFINE_integer("stage2_port_number", 6690, "第二阶段 learner 端口。")
+flags.DEFINE_integer("stage2_broadcast_port", 6691, "第二阶段 learner 广播端口。")
 flags.DEFINE_string(
     "reward_classifier_ckpt_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/classifier_ckpt", "Path to reward classifier ckpt for cam1."
 )
@@ -1235,6 +1279,25 @@ else:
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('devices'))
 
 
+STAGE_TASKS = ("stage1", "stage2")
+
+
+def get_stage_checkpoint_path(stage_name):
+    return FLAGS.stage1_checkpoint_path if stage_name == "stage1" else FLAGS.stage2_checkpoint_path
+
+
+def get_stage_trainer_config(stage_name):
+    if stage_name == "stage1":
+        return make_trainer_config(
+            port_number=FLAGS.stage1_port_number,
+            broadcast_port=FLAGS.stage1_broadcast_port,
+        )
+    return make_trainer_config(
+        port_number=FLAGS.stage2_port_number,
+        broadcast_port=FLAGS.stage2_broadcast_port,
+    )
+
+
 def print_green(x):
     """打印绿色文本"""
     return print("\033[92m {}\033[00m".format(x))
@@ -1265,38 +1328,89 @@ def verify_classifier_camera_alignment():
     )
 
 
+def find_wrapper(wrapped_env, cls):
+    cur = wrapped_env
+    for _ in range(32):
+        if isinstance(cur, cls):
+            return cur
+        if not hasattr(cur, "env"):
+            break
+        cur = cur.env
+    return None
+
+
+def set_reward_wrapper_stage(env, stage_name):
+    reward_wrapper = find_wrapper(env, ClassifierRewardWrapper)
+    if reward_wrapper is not None:
+        reward_wrapper.set_stage(stage_name)
+
+
+def restore_agent_from_checkpoint(
+    agent: DrQAgent,
+    checkpoint_path: str,
+    label: str,
+    fallback_checkpoint_path: str = None,
+    reset_step_on_fallback: bool = False,
+):
+    candidate_paths = [checkpoint_path]
+    if fallback_checkpoint_path and fallback_checkpoint_path not in candidate_paths:
+        candidate_paths.append(fallback_checkpoint_path)
+
+    for idx, ckpt_path in enumerate(candidate_paths):
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            continue
+        latest_ckpt = checkpoints.latest_checkpoint(ckpt_path)
+        if not latest_ckpt:
+            continue
+
+        source_label = label if idx == 0 else f"{label} (fallback)"
+        print(f"Restoring {source_label} checkpoint from {latest_ckpt}")
+        restored_state = checkpoints.restore_checkpoint(ckpt_path, agent.state)
+        if idx > 0 and reset_step_on_fallback:
+            step_dtype = getattr(restored_state.step, "dtype", jnp.int32)
+            restored_state = restored_state.replace(step=jnp.asarray(0, dtype=step_dtype))
+            print(f"{label}: fallback checkpoint loaded; resetting internal step to 0 for new stage training.")
+        agent = agent.replace(state=restored_state)
+        print(f"{label} resumed from internal step {int(agent.state.step)}")
+        return agent, ckpt_path
+
+    print(f"No checkpoint found for {label}; starting from scratch.")
+    return agent, None
+
+
 ##############################################################################
 
 
-def actor(agent: DrQAgent, data_store, env, sampling_rng):
+def actor(agent_or_agents, data_store_or_stores, env, sampling_rng):
     """
     Actor 循环，当 "--actor" 设置为 True 时运行。
     负责与环境交互、收集数据并发送给 Learner。
     """
     # 如果是纯评估模式 (FLAGS.eval)，则无限循环评估最新的 Checkpoint
     if FLAGS.eval:
-        print_green("Starting Pure Evaluation Mode (Infinite Episodes)")
-        # 评估模式默认渲染画面
+        print_green("Starting Pure Two-Stage Evaluation Mode (Infinite Episodes)")
         FLAGS.render = True
-        
+        agents = agent_or_agents
         while True:
-            # 自动加载最新检查点
-            latest_ckpt = checkpoints.latest_checkpoint(FLAGS.checkpoint_path)
-            if latest_ckpt:
-                print(f"[Eval] Loading latest checkpoint: {latest_ckpt}")
-                restored_state = checkpoints.restore_checkpoint(FLAGS.checkpoint_path, agent.state)
-                agent = agent.replace(state=restored_state)
-            else:
-                print("[Eval] WARNING: No checkpoint found. Running with random/initial weights.")
+            for stage_name in STAGE_TASKS:
+                ckpt_path = get_stage_checkpoint_path(stage_name)
+                latest_ckpt = checkpoints.latest_checkpoint(ckpt_path)
+                if latest_ckpt:
+                    print(f"[Eval] Loading {stage_name} checkpoint: {latest_ckpt}")
+                    restored_state = checkpoints.restore_checkpoint(ckpt_path, agents[stage_name].state)
+                    agents[stage_name] = agents[stage_name].replace(state=restored_state)
+                else:
+                    print(f"[Eval] WARNING: No checkpoint found for {stage_name}.")
 
-            # 运行评估轨迹
             obs, _ = env.reset()
-            done = False
-            step = 0
-            
-            while not done and step < FLAGS.max_traj_length:
-                # 确定性动作选择 (argmax=True)
-                actions = agent.sample_actions(
+            current_stage = "stage1"
+            set_reward_wrapper_stage(env, current_stage)
+            stage1_success = False
+            stage2_success = False
+            total_steps = 0
+
+            while total_steps < FLAGS.max_traj_length:
+                actions = agents[current_stage].sample_actions(
                     observations=jax.device_put(obs),
                     argmax=True,
                 )
@@ -1304,13 +1418,25 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
 
                 next_obs, reward, done, truncated, info = env.step(actions)
                 obs = next_obs
-                step += 1
-                
+                total_steps += 1
+
                 if done or truncated:
+                    if current_stage == "stage1" and info.get("manual_success", False):
+                        stage1_success = True
+                        current_stage = "stage2"
+                        set_reward_wrapper_stage(env, current_stage)
+                        continue
+                    if current_stage == "stage2" and info.get("manual_success", False):
+                        stage2_success = True
                     break
-            
-            print(f"[Eval] Episode Finished. Steps: {step}, Success: {info.get('success')}")
-            time.sleep(1.0) # 回合间稍微停顿
+
+            print(
+                f"[Eval] Episode Finished. steps={total_steps}, "
+                f"stage1_success={stage1_success}, "
+                f"stage2_success={stage2_success}, "
+                f"overall_success={stage1_success and stage2_success}"
+            )
+            time.sleep(1.0)
 
     # 如果指定了评估步数 (Original Actor Eval logic)
     elif FLAGS.eval_checkpoint_step:
@@ -1319,11 +1445,11 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
 
         # 加载指定步数的 Checkpoint
         ckpt = checkpoints.restore_checkpoint(
-            FLAGS.checkpoint_path,
-            agent.state,
+            get_stage_checkpoint_path("stage1"),
+            agent_or_agents.state,
             step=FLAGS.eval_checkpoint_step,
         )
-        agent = agent.replace(state=ckpt)
+        agent_or_agents = agent_or_agents.replace(state=ckpt)
 
         # 运行评估循环
         for episode in range(FLAGS.eval_n_trajs):
@@ -1332,7 +1458,7 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
             start_time = time.time()
             while not done:
                 # 采样动作 (评估时使用确定性策略 argmax=True)
-                actions = agent.sample_actions(
+                actions = agent_or_agents.sample_actions(
                     observations=jax.device_put(obs),
                     argmax=True,
                 )
@@ -1355,25 +1481,46 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
         print(f"average time: {np.mean(time_list)}")
         return  # 评估完成后退出
 
-    # 创建 TrainerClient 连接到 Learner
-    client = TrainerClient(
-        "actor_env",
-        FLAGS.ip,
-        make_trainer_config(),
-        data_store,
-        wait_for_server=True,
-    )
+    two_stage_enabled = FLAGS.enable_two_stage_training
+    if two_stage_enabled:
+        agents = agent_or_agents
+        data_store = data_store_or_stores
+        client = TrainerClient(
+            "actor_env",
+            FLAGS.ip,
+            get_stage_trainer_config("stage2"),
+            data_store,
+            wait_for_server=True,
+        )
 
-    # 回调函数：用于更新 Agent 的参数
-    def update_params(params):
-        nonlocal agent
-        agent = agent.replace(state=agent.state.replace(params=params))
+        def update_params_stage2(params):
+            nonlocal agents
+            agents["stage2"] = agents["stage2"].replace(
+                state=agents["stage2"].state.replace(params=params)
+            )
 
-    # 注册接收网络参数的回调
-    client.recv_network_callback(update_params)
+        client.recv_network_callback(update_params_stage2)
+    else:
+        agent = agent_or_agents
+        data_store = data_store_or_stores
+        client = TrainerClient(
+            "actor_env",
+            FLAGS.ip,
+            get_stage_trainer_config("stage1"),
+            data_store,
+            wait_for_server=True,
+        )
+
+        def update_params(params):
+            nonlocal agent
+            agent = agent.replace(state=agent.state.replace(params=params))
+
+        client.recv_network_callback(update_params)
 
     print("[Actor] Resetting environment...")
     obs, _ = env.reset()
+    current_stage = "stage1"
+    set_reward_wrapper_stage(env, current_stage)
     print("[Actor] Environment reset done.")
     done = False
     transition_debug_counter = 0
@@ -1465,13 +1612,29 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
     running_return = 0.0
 
     print("[Actor] Starting training loop...")
-    actor_step = 0
-    pbar = tqdm.tqdm(total=FLAGS.max_steps, dynamic_ncols=True)
-    while actor_step < FLAGS.max_steps:
+    if two_stage_enabled:
+        actor_step = 0
+        pbar = tqdm.tqdm(total=FLAGS.max_steps, dynamic_ncols=True, desc="stage2 actor")
+    else:
+        actor_step = 0
+        pbar = tqdm.tqdm(total=FLAGS.max_steps, dynamic_ncols=True)
+
+    def get_stage_step(stage_name):
+        return actor_step
+
+    while True:
+        if two_stage_enabled:
+            if actor_step >= FLAGS.max_steps:
+                break
+        else:
+            if actor_step >= FLAGS.max_steps:
+                break
+
         timer.tick("total")
         skip_transition = False
         inserted_sampled_transition = False
         intervention_mode_active = _is_intervention_mode_active(env)
+        transition_stage = current_stage
 
         with timer.context("sample_actions"):
             # 接管模式开启时，不做策略输出；动作由 3D 鼠标 wrapper 决定
@@ -1479,12 +1642,19 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
                 actions = np.zeros(env.action_space.shape, dtype=np.float32)
             else:
                 # 在初始随机步数内，使用随机动作进行探索
-                if actor_step < FLAGS.random_steps:
+                if two_stage_enabled and current_stage == "stage1":
+                    actions = agents["stage1"].sample_actions(
+                        observations=jax.device_put(obs),
+                        argmax=True,
+                    )
+                    actions = np.asarray(jax.device_get(actions))
+                elif get_stage_step(current_stage) < FLAGS.random_steps:
                     actions = env.action_space.sample()
                 else:
                     # 之后使用 Agent 策略采样动作 (随机性用于探索)
                     sampling_rng, key = jax.random.split(sampling_rng)
-                    actions = agent.sample_actions(
+                    active_agent = agents[current_stage] if two_stage_enabled else agent
+                    actions = active_agent.sample_actions(
                         observations=jax.device_put(obs),
                         seed=key,
                         deterministic=False,
@@ -1568,7 +1738,11 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
                     transition=transition,
                 )
                 # 将数据插入本地队列，准备发送给 Learner
-                data_store.insert(transition)
+                if two_stage_enabled:
+                    if current_stage == "stage2":
+                        data_store.insert(transition)
+                else:
+                    data_store.insert(transition)
 
                 obs = next_obs
 
@@ -1627,29 +1801,60 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
                 # ---------------------
 
                 if done or truncated:
-                    stats = {"train": info}  # 发送统计数据给 Learner 记录日志
-                    client.request("send-stats", stats)
-                    running_return = 0.0
-                    obs, _ = env.reset()
+                    if two_stage_enabled:
+                        if transition_stage == "stage1" and info.get("manual_success", False):
+                            print("[Actor] Stage1 success received. Switching to stage2 policy without global reset.")
+                            current_stage = "stage2"
+                            set_reward_wrapper_stage(env, current_stage)
+                        else:
+                            if transition_stage == "stage2":
+                                stats = {
+                                    "stage2_train": info,
+                                    "env_steps": actor_step + 1,
+                                }
+                                client.request("send-stats", stats)
+                            running_return = 0.0
+                            current_stage = "stage1"
+                            set_reward_wrapper_stage(env, current_stage)
+                            obs, _ = env.reset()
+                    else:
+                        stats = {"train": info}  # 发送统计数据给 Learner 记录日志
+                        client.request("send-stats", stats)
+                        running_return = 0.0
+                        obs, _ = env.reset()
 
         timer.tock("total")
 
         # 只要这一轮真正写入了 transition，就推进 actor 计数。
         # 这样人工接管的有效控制步也会计入训练步数；只有 intervention idle/no-op 不计数。
-        count_actor_step = not skip_transition
+        count_actor_step = (not skip_transition) and ((not two_stage_enabled) or transition_stage == "stage2")
 
         if count_actor_step:
-            actor_step += 1
-            pbar.update(1)
+            if two_stage_enabled:
+                actor_step += 1
+                pbar.update(1)
 
-            # 定期从 Learner 更新网络参数
-            if actor_step % FLAGS.steps_per_update == 0:
-                client.update()
+                if actor_step % FLAGS.steps_per_update == 0:
+                    client.update()
 
-            # 定期发送计时器统计数据
-            if actor_step % FLAGS.log_period == 0:
-                stats = {"timer": timer.get_average_times()}
-                client.request("send-stats", stats)
+                if actor_step % FLAGS.log_period == 0:
+                    stats = {
+                        "stage2_timer": timer.get_average_times(),
+                        "env_steps": actor_step,
+                    }
+                    client.request("send-stats", stats)
+            else:
+                actor_step += 1
+                pbar.update(1)
+
+                # 定期从 Learner 更新网络参数
+                if actor_step % FLAGS.steps_per_update == 0:
+                    client.update()
+
+                # 定期发送计时器统计数据
+                if actor_step % FLAGS.log_period == 0:
+                    stats = {"timer": timer.get_average_times()}
+                    client.request("send-stats", stats)
 
     pbar.close()
 
@@ -1657,7 +1862,7 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
 ##############################################################################
 
 
-def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
+def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer, stage_name="stage1"):
     """
     Learner 循环，当 "--learner" 设置为 True 时运行。
     负责从 Buffer 采样数据并更新 Agent 网络。
@@ -1665,7 +1870,7 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
     # 设置 wandb 和日志记录
     wandb_logger = make_wandb_logger(
         project="serl_dev",
-        description=FLAGS.exp_name or FLAGS.env,
+        description=f"{FLAGS.exp_name or FLAGS.env}_{stage_name}",
         debug=FLAGS.debug,
     )
 
@@ -1674,8 +1879,9 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
     
     # 如果从 Checkpoint 恢复，调整 update_steps 以匹配 Checkpoint 的步数
     # 这样 WandB 日志可以连续记录
-    if FLAGS.checkpoint_path and os.path.exists(FLAGS.checkpoint_path):
-        latest_ckpt = checkpoints.latest_checkpoint(FLAGS.checkpoint_path)
+    checkpoint_path = get_stage_checkpoint_path(stage_name)
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        latest_ckpt = checkpoints.latest_checkpoint(checkpoint_path)
         if latest_ckpt:
             try:
                 ckpt_step = int(latest_ckpt.split('_')[-1])
@@ -1693,7 +1899,7 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
         return {}  # 不期望返回值
 
     # 创建 TrainerServer
-    server = TrainerServer(make_trainer_config(), request_callback=stats_callback)
+    server = TrainerServer(get_stage_trainer_config(stage_name), request_callback=stats_callback)
     server.register_data_store("actor_env", replay_buffer)
     server.start(threaded=True)
 
@@ -1717,20 +1923,24 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
 
     # 创建数据迭代器 (RLPD 核心逻辑)
     # 50% 数据来自 Replay Buffer (在线数据)，50% 来自 Demo Buffer (演示数据)
+    use_demo_buffer = len(demo_buffer) > 0
+    replay_batch_size = FLAGS.batch_size // 2 if use_demo_buffer else FLAGS.batch_size
     replay_iterator = replay_buffer.get_iterator(
         sample_args={
-            "batch_size": FLAGS.batch_size // 2,
+            "batch_size": replay_batch_size,
             "pack_obs_and_next_obs": True,
         },
         device=sharding,
     )
-    demo_iterator = demo_buffer.get_iterator(
-        sample_args={
-            "batch_size": FLAGS.batch_size // 2,
-            "pack_obs_and_next_obs": True,
-        },
-        device=sharding,
-    )
+    demo_iterator = None
+    if use_demo_buffer:
+        demo_iterator = demo_buffer.get_iterator(
+            sample_args={
+                "batch_size": FLAGS.batch_size // 2,
+                "pack_obs_and_next_obs": True,
+            },
+            device=sharding,
+        )
 
     # Learner 主循环
     timer = Timer()
@@ -1741,9 +1951,10 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
         for critic_step in range(FLAGS.critic_actor_ratio - 1):
             with timer.context("sample_replay_buffer"):
                 batch = next(replay_iterator)
-                demo_batch = next(demo_iterator)
-                # 拼接在线数据和演示数据
-                batch = concat_batches(batch, demo_batch, axis=0)
+                if use_demo_buffer:
+                    demo_batch = next(demo_iterator)
+                    # 拼接在线数据和演示数据
+                    batch = concat_batches(batch, demo_batch, axis=0)
 
             with timer.context("train_critics"):
                 # 仅更新 Critic
@@ -1753,8 +1964,9 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
 
         with timer.context("train"):
             batch = next(replay_iterator)
-            demo_batch = next(demo_iterator)
-            batch = concat_batches(batch, demo_batch, axis=0)
+            if use_demo_buffer:
+                demo_batch = next(demo_iterator)
+                batch = concat_batches(batch, demo_batch, axis=0)
             # 更新 Actor 和 Critic (High UTD)
             agent, update_info = agent.update_high_utd(batch, utd_ratio=1)
 
@@ -1777,14 +1989,262 @@ def learner(rng, agent: DrQAgent, replay_buffer, demo_buffer):
 
         # 保存 Checkpoint
         if FLAGS.checkpoint_period and update_steps % FLAGS.checkpoint_period == 0:
-            assert FLAGS.checkpoint_path is not None
+            assert checkpoint_path is not None
             checkpoints.save_checkpoint(
-                FLAGS.checkpoint_path, agent.state, step=update_steps, keep=100, overwrite=True
+                checkpoint_path, agent.state, step=update_steps, keep=100, overwrite=True
             )
 
         update_steps += 1
 
     learner_pbar.close()
+
+
+##############################################################################
+
+
+def learner_two_stage(rng, agents, replay_buffers, demo_buffers):
+    """
+    单个 learner 进程只训练 stage2。
+    stage1 仅作为已完成子任务的固定策略存在，不参与 replay/learner 更新。
+    """
+    wandb_logger = make_wandb_logger(
+        project="serl_dev",
+        description=FLAGS.exp_name or FLAGS.env,
+        debug=FLAGS.debug,
+    )
+
+    update_steps = int(agents["stage2"].state.step)
+
+    def stats_callback(type: str, payload: dict) -> dict:
+        assert type == "send-stats", f"Invalid request type: {type}"
+        if wandb_logger is not None:
+            wandb_logger.log(payload, step=update_steps)
+        return {}
+
+    server = TrainerServer(
+        get_stage_trainer_config("stage2"),
+        request_callback=stats_callback,
+    )
+    server.register_data_store("actor_env", replay_buffers["stage2"])
+    server.start(threaded=True)
+    server.publish_network(agents["stage2"].state.params)
+    print_green("sent initial stage2 network to actor")
+
+    pbar = tqdm.tqdm(
+        total=FLAGS.training_starts,
+        initial=len(replay_buffers["stage2"]),
+        desc="Filling up stage2 replay buffer",
+        position=0,
+        leave=True,
+    )
+    while len(replay_buffers["stage2"]) < FLAGS.training_starts:
+        pbar.update(len(replay_buffers["stage2"]) - pbar.n)
+        time.sleep(1)
+    pbar.update(len(replay_buffers["stage2"]) - pbar.n)
+    pbar.close()
+
+    iterators = None
+    use_demo_buffer = len(demo_buffers["stage2"]) > 0
+    timer = Timer()
+    learner_pbar = tqdm.tqdm(range(FLAGS.max_steps), dynamic_ncols=True, desc="stage2 learner")
+
+    def ensure_iterators():
+        nonlocal iterators
+        if iterators is not None:
+            return True
+        if len(replay_buffers["stage2"]) < FLAGS.training_starts:
+            return False
+
+        replay_batch_size = FLAGS.batch_size // 2 if use_demo_buffer else FLAGS.batch_size
+        replay_iterator = replay_buffers["stage2"].get_iterator(
+            sample_args={
+                "batch_size": replay_batch_size,
+                "pack_obs_and_next_obs": True,
+            },
+            device=sharding,
+        )
+        demo_iterator = None
+        if use_demo_buffer:
+            demo_iterator = demo_buffers["stage2"].get_iterator(
+                sample_args={
+                    "batch_size": FLAGS.batch_size // 2,
+                    "pack_obs_and_next_obs": True,
+                },
+                device=sharding,
+            )
+        iterators = (replay_iterator, demo_iterator)
+        print_green("stage2 replay buffer is ready; learner updates enabled.")
+        return True
+
+    for _ in learner_pbar:
+        did_update = False
+        if ensure_iterators():
+            replay_iterator, demo_iterator = iterators
+
+            for critic_step in range(FLAGS.critic_actor_ratio - 1):
+                with timer.context("stage2_sample_replay_buffer"):
+                    batch = next(replay_iterator)
+                    if use_demo_buffer:
+                        demo_batch = next(demo_iterator)
+                        batch = concat_batches(batch, demo_batch, axis=0)
+
+                with timer.context("stage2_train_critics"):
+                    agents["stage2"], critics_info = agents["stage2"].update_critics(batch)
+
+            with timer.context("stage2_train"):
+                batch = next(replay_iterator)
+                if use_demo_buffer:
+                    demo_batch = next(demo_iterator)
+                    batch = concat_batches(batch, demo_batch, axis=0)
+                agents["stage2"], update_info = agents["stage2"].update_high_utd(batch, utd_ratio=1)
+
+            if update_steps > 0 and update_steps % FLAGS.steps_per_update == 0:
+                agents["stage2"] = jax.block_until_ready(agents["stage2"])
+                server.publish_network(agents["stage2"].state.params)
+
+            if update_steps % FLAGS.log_period == 0 and wandb_logger:
+                prefixed_update_info = {
+                    f"stage2_{k}": v for k, v in update_info.items()
+                }
+                wandb_logger.log(prefixed_update_info, step=update_steps)
+                wandb_logger.log(
+                    {"stage2_timer": timer.get_average_times()},
+                    step=update_steps,
+                )
+                wandb_logger.log(
+                    {
+                        "stage2_replay_size": len(replay_buffers["stage2"]),
+                        "stage2_demo_size": len(demo_buffers["stage2"]),
+                    },
+                    step=update_steps,
+                )
+
+            checkpoint_path = get_stage_checkpoint_path("stage2")
+            if FLAGS.checkpoint_period and update_steps % FLAGS.checkpoint_period == 0:
+                checkpoints.save_checkpoint(
+                    checkpoint_path,
+                    agents["stage2"].state,
+                    step=update_steps,
+                    keep=100,
+                    overwrite=True,
+                )
+
+            update_steps += 1
+            learner_pbar.set_postfix(
+                update_step=int(update_steps),
+                replay_size=len(replay_buffers["stage2"]),
+                demo_size=len(demo_buffers["stage2"]),
+                refresh=False,
+            )
+            did_update = True
+
+        if not did_update:
+            time.sleep(1)
+    learner_pbar.close()
+
+
+##############################################################################
+
+
+def load_demo_buffer(demo_buffer, training_image_keys, stage_name="stage1"):
+    demo_path = resolve_demo_path()
+    if stage_name == "stage2" and FLAGS.enable_two_stage_training:
+        print("Stage2 learner: skipping demo loading and training from its own online replay buffer.")
+        return
+
+    print(f"Resolved demo path ({FLAGS.demo_pkl_variant}): {demo_path}")
+    if not demo_path:
+        print("WARNING: No demo path provided. Demo buffer will be empty.")
+        return
+
+    if not os.path.exists(demo_path):
+        raise FileNotFoundError(f"File {demo_path} not found")
+
+    with open(demo_path, "rb") as f:
+        transitions = pkl.load(f)
+
+    print(f"Loading {len(transitions)} transitions from {demo_path} into {stage_name} demo buffer...")
+    demo_over_limit_count = 0
+    demo_loaded_count = 0
+    demo_skipped_count = 0
+
+    for i, t in enumerate(transitions):
+        obs_state = t['observations']['state']
+        if t['next_observations'] is not None:
+            next_obs_state = t['next_observations']['state']
+            next_obs_dict = {k: v for k, v in t["next_observations"].items() if k != "state"}
+        else:
+            next_obs_state = obs_state
+            next_obs_dict = {k: v for k, v in t["observations"].items() if k != "state"}
+
+        if obs_state.shape[0] != 13:
+            print(f"Warning: Demo state shape mismatch. Expected 13, got {obs_state.shape[0]}")
+
+        final_state = obs_state
+        final_next_state = next_obs_state
+
+        action_physical = t["actions"]
+        action_pos_physical = action_physical[:3]
+        action_rot_physical = action_physical[3:6]
+        gripper_physical = action_physical[6]
+
+        SCALE_POS = 0.01
+        SCALE_ROT = 0.05
+
+        action_pos_norm = action_pos_physical / SCALE_POS
+        action_rot_norm = action_rot_physical / SCALE_ROT
+        gripper_norm = (gripper_physical / 0.5236) + 1.0
+        over_limit = (
+            np.any(np.abs(action_pos_norm) > 1.0)
+            or np.any(np.abs(action_rot_norm) > 1.0)
+            or abs(float(gripper_norm)) > 1.0
+        )
+        if over_limit:
+            demo_over_limit_count += 1
+            if FLAGS.demo_drop_over_limit_transitions:
+                demo_skipped_count += 1
+                continue
+
+        action_pos_norm = np.clip(action_pos_norm, -1.0, 1.0)
+        action_rot_norm = np.clip(action_rot_norm, -1.0, 1.0)
+        gripper_norm = np.clip(gripper_norm, -1.0, 1.0)
+        final_action = np.concatenate([action_pos_norm, action_rot_norm, [gripper_norm]])
+
+        reward_val = t['rewards']
+        valid_keys = set(training_image_keys) | {"state"}
+        obs_dict = {}
+        next_obs_dict_final = {}
+
+        def process_obs_dict(source_dict, target_dict):
+            for k, v in source_dict.items():
+                if k not in valid_keys and k != "state":
+                    continue
+                if k == "image_left":
+                    target_dict[k] = np.zeros_like(v)
+                else:
+                    target_dict[k] = v
+
+        process_obs_dict(t["observations"], obs_dict)
+        process_obs_dict(next_obs_dict, next_obs_dict_final)
+        obs_dict["state"] = final_state
+        next_obs_dict_final["state"] = final_next_state
+
+        done = bool(t["dones"])
+        transition = {
+            "observations": obs_dict,
+            "next_observations": next_obs_dict_final,
+            "actions": final_action,
+            "rewards": np.array(reward_val, dtype=np.float32),
+            "masks": np.array(0.0 if done else 1.0, dtype=np.float32),
+            "dones": done,
+        }
+        demo_buffer.insert(transition)
+        demo_loaded_count += 1
+
+    print(
+        f"{stage_name} demo buffer size: {len(demo_buffer)} "
+        f"(loaded={demo_loaded_count}, over_limit={demo_over_limit_count}, skipped={demo_skipped_count})"
+    )
 
 
 ##############################################################################
@@ -1853,7 +2313,7 @@ def main(_):
 
         # 3D Mouse intervention for actor training (evdev, same source as test_3dx_operation.py).
         # Wrapper injects info["intervene_action"], and actor loop already writes it to replay buffer.
-        if FLAGS.actor and FLAGS.enable_spacemouse_intervention:
+        if (FLAGS.actor or FLAGS.eval) and FLAGS.enable_spacemouse_intervention:
             env = EvdevSpacemouseIntervention(
                 env,
                 event_path=FLAGS.spacemouse_event_path,
@@ -1875,9 +2335,10 @@ def main(_):
                 gripper_close_cmd=FLAGS.spacemouse_gripper_close_cmd,
                 print_raw=FLAGS.spacemouse_print_raw,
             )
-            print("[Actor] EvdevSpacemouseIntervention enabled: intervene_action will be stored into replay buffer.")
+            mode_label = "Actor" if FLAGS.actor else "Eval"
+            print(f"[{mode_label}] EvdevSpacemouseIntervention enabled: gripper follows 3D mouse button state.")
 
-        print("[Train] Gripper learning enabled: policy/intervention both write gripper action directly.")
+        print("[Train] Gripper is controlled only by 3D mouse button state; policy controls arm motion only.")
     
     # Move RecordEpisodeStatistics here (outermost) to capture rewards from ForwardReachRewardWrapper
     env = RecordEpisodeStatistics(env) # 记录统计信息
@@ -1904,195 +2365,135 @@ def main(_):
         jax.tree_util.tree_map(jnp.array, agent), sharding
     )
 
-    # 如果存在 Checkpoint，则恢复
-    if FLAGS.checkpoint_path and os.path.exists(FLAGS.checkpoint_path):
-        latest_ckpt = checkpoints.latest_checkpoint(FLAGS.checkpoint_path)
-        if latest_ckpt:
-            print(f"Restoring checkpoint from {latest_ckpt}")
-            restored_state = checkpoints.restore_checkpoint(FLAGS.checkpoint_path, agent.state)
-            
-            try:
-                ckpt_step = int(latest_ckpt.split('_')[-1])
-                print(f"Restored agent step: {int(restored_state.step)}, Checkpoint step: {ckpt_step}")
-                agent = agent.replace(state=restored_state)
-            except ValueError:
-                print("Warning: Could not parse step from checkpoint path")
-            
-            print(f"Resumed from internal step {int(agent.state.step)}")
-        else:
-            print("No checkpoint found, starting from scratch.")
-
     if FLAGS.learner:
-        # Learner 模式：初始化 Replay Buffer 和 Demo Buffer
-        
-        # 将随机数生成器也放到设备上，并复制。
-        # 这样在多设备训练时，每个设备都能独立生成随机数（用于从 Buffer 采样等操作）。
         sampling_rng = jax.device_put(sampling_rng, device=sharding)
-        
-        # 1. 初始化在线 Replay Buffer (存放 Actor 刚刚采集的新鲜数据)
-        # MemoryEfficient: 这个类通常会对图像数据做优化（例如存为 uint8 格式，只在训练时转为 float32），以节省内存。
-        replay_buffer = MemoryEfficientReplayBufferDataStore(
-            env.observation_space,
-            env.action_space,
-            capacity=FLAGS.replay_buffer_capacity, # 容量通常较大 (如 20万)
-            image_keys=training_image_keys,        # 包含 Left
-        )
-        
-        # 2. 初始化演示 Demo Buffer (存放离线录制的专家数据)
-        # 这是一个独立的 Buffer，用于 RLPD (RL with Prior Data) 算法。
-        # 训练时，我们会从这两个 Buffer 各取一半数据 (50/50) 来更新网络。
-        demo_buffer = MemoryEfficientReplayBufferDataStore(
-            env.observation_space,
-            env.action_space,
-            capacity=10000,                        # 容量较小，只需装下所有 Demo 即可
-            image_keys=training_image_keys,
-        )
 
-        # 加载 Demo 数据
-        demo_path = resolve_demo_path()
-        print(f"Resolved demo path ({FLAGS.demo_pkl_variant}): {demo_path}")
-        if demo_path:
-            # 检查文件是否存在
-            if not os.path.exists(demo_path):
-                raise FileNotFoundError(f"File {demo_path} not found")
+        if FLAGS.enable_two_stage_training:
+            agents = {}
+            replay_buffers = {}
+            demo_buffers = {}
 
-            with open(demo_path, "rb") as f:
-                transitions = pkl.load(f)
+            agents["stage1"], _ = restore_agent_from_checkpoint(
+                agent,
+                FLAGS.stage1_checkpoint_path,
+                label="stage1 learner",
+            )
 
-                print(f"Loading {len(transitions)} transitions from {demo_path}...")
-                demo_over_limit_count = 0
-                demo_loaded_count = 0
-                demo_skipped_count = 0
+            stage2_agent = make_drq_agent(
+                seed=FLAGS.seed,
+                sample_obs=env.observation_space.sample(),
+                sample_action=env.action_space.sample(),
+                image_keys=training_image_keys,
+                encoder_type=FLAGS.encoder_type,
+            )
+            stage2_agent = jax.device_put(
+                jax.tree_util.tree_map(jnp.array, stage2_agent), sharding
+            )
+            agents["stage2"], _ = restore_agent_from_checkpoint(
+                stage2_agent,
+                FLAGS.stage2_checkpoint_path,
+                label="stage2 learner",
+                fallback_checkpoint_path=FLAGS.stage1_checkpoint_path,
+                reset_step_on_fallback=True,
+            )
 
-                for i, t in enumerate(transitions):
-                    # --- 解析 Demo 数据 (Refer to process_demos.py) ---
-                    # New Format in PKL: State is ALREADY 13-dim Relative State
-                    # [Gripper(1), Euler(6), Vel(6)]
-                    
-                    obs_state = t['observations']['state']
-                    if t['next_observations'] is not None:
-                        next_obs_state = t['next_observations']['state']
-                        # Handle other keys if needed, but for now we focus on state
-                        next_obs_dict = {k: v for k, v in t["next_observations"].items() if k != "state"}
-                    else:
-                        # Terminal state: next_obs is None. Use current obs as placeholder.
-                        next_obs_state = obs_state
-                        next_obs_dict = {k: v for k, v in t["observations"].items() if k != "state"}
+            for stage_name in STAGE_TASKS:
+                replay_buffers[stage_name] = MemoryEfficientReplayBufferDataStore(
+                    env.observation_space,
+                    env.action_space,
+                    capacity=FLAGS.replay_buffer_capacity,
+                    image_keys=training_image_keys,
+                )
+                demo_buffers[stage_name] = MemoryEfficientReplayBufferDataStore(
+                    env.observation_space,
+                    env.action_space,
+                    capacity=10000,
+                    image_keys=training_image_keys,
+                )
 
-                    # Verify shape if needed (defensive)
-                    if obs_state.shape[0] != 13:
-                        print(f"Warning: Demo state shape mismatch. Expected 13, got {obs_state.shape[0]}")
-                    
-                    final_state = obs_state
-                    final_next_state = next_obs_state
-                    
-                    # --- 4. 动作归一化 (Action Normalization) ---
-                    # Demo actions are Physical. Env expects [-1, 1].
-                    action_physical = t["actions"]
-                    
-                    # process_demos logic: action is [Pos(3), Rot(3), Grip(1)] (7,)
-                    action_pos_physical = action_physical[:3]
-                    action_rot_physical = action_physical[3:6]
-                    gripper_physical = action_physical[6]
-                    
-                    SCALE_POS = 0.01
-                    SCALE_ROT = 0.05
-                    
-                    # Normalize
-                    action_pos_norm = action_pos_physical / SCALE_POS
-                    action_rot_norm = action_rot_physical / SCALE_ROT
-                    
-                    # Gripper: val = 0.5236 * (norm - 1.0) => norm = (val / 0.5236) + 1.0
-                    gripper_norm = (gripper_physical / 0.5236) + 1.0
-                    over_limit = (
-                        np.any(np.abs(action_pos_norm) > 1.0)
-                        or np.any(np.abs(action_rot_norm) > 1.0)
-                        or abs(float(gripper_norm)) > 1.0
-                    )
-                    if over_limit:
-                        demo_over_limit_count += 1
-                        if FLAGS.demo_drop_over_limit_transitions:
-                            demo_skipped_count += 1
-                            continue
+            load_demo_buffer(demo_buffers["stage2"], training_image_keys, stage_name="stage2")
 
-                    action_pos_norm = np.clip(action_pos_norm, -1.0, 1.0)
-                    action_rot_norm = np.clip(action_rot_norm, -1.0, 1.0)
-                    gripper_norm = np.clip(gripper_norm, -1.0, 1.0)
-                    
-                    final_action = np.concatenate([action_pos_norm, action_rot_norm, [gripper_norm]])
-                    
-                    # --- 5. 奖励 (Rewards) ---
-                    # 使用 PKL 中已有的奖励，不重置
-                    reward_val = t['rewards']
-
-                    # Filter observations to match configured keys
-                    # image_keys contains enabled images. We also need 'state'.
-                    valid_keys = set(training_image_keys) | {"state"}
-                    
-                    # --- Mask 'image_left' with Zeros ---
-                    # To maintain checkpoint compatibility (3 encoders), we keep 'image_left' in the dict
-                    # but set it to black/zeros so the network learns to ignore it.
-                    obs_dict = {}
-                    next_obs_dict_final = {}
-                    
-                    # Helper to process keys
-                    def process_obs_dict(source_dict, target_dict):
-                        for k, v in source_dict.items():
-                            if k not in valid_keys and k != "state":
-                                continue
-                            
-                            if k == "image_left":
-                                # Replace with Zeros. Shape matches v
-                                target_dict[k] = np.zeros_like(v)
-                            else:
-                                target_dict[k] = v
-                    
-                    # t["observations"] might have state, we handle state explicitly below
-                    process_obs_dict(t["observations"], obs_dict)
-                    process_obs_dict(next_obs_dict, next_obs_dict_final)
-                    
-                    # Ensure 'state' is present
-                    obs_dict["state"] = final_state
-                    next_obs_dict_final["state"] = final_next_state
-                    
-                    # Construct Transition
-                    done = bool(t["dones"])
-                    transition = {
-                        "observations": obs_dict,
-                        "next_observations": next_obs_dict_final,
-                        "actions": final_action,
-                        "rewards": np.array(reward_val, dtype=np.float32), 
-                        "masks": np.array(0.0 if done else 1.0, dtype=np.float32),
-                        "dones": done,
-                    }
-                    demo_buffer.insert(transition)
-                    demo_loaded_count += 1
-            print(
-                f"demo buffer size: {len(demo_buffer)} "
-                f"(loaded={demo_loaded_count}, over_limit={demo_over_limit_count}, skipped={demo_skipped_count})"
+            print_green("starting stage2-only learner loop with frozen stage1 policy")
+            learner_two_stage(
+                sampling_rng,
+                agents,
+                replay_buffers,
+                demo_buffers,
             )
         else:
-            print("WARNING: No demo path provided. Demo buffer will be empty.")
+            agent, _ = restore_agent_from_checkpoint(
+                agent,
+                FLAGS.stage1_checkpoint_path,
+                label="stage1 learner",
+            )
 
-        # 启动 Learner 循环
-        print_green("starting learner loop")
-        learner(
-            sampling_rng,
-            agent,
-            replay_buffer,
-            demo_buffer=demo_buffer,
-        )
+            replay_buffer = MemoryEfficientReplayBufferDataStore(
+                env.observation_space,
+                env.action_space,
+                capacity=FLAGS.replay_buffer_capacity,
+                image_keys=training_image_keys,
+            )
+            demo_buffer = MemoryEfficientReplayBufferDataStore(
+                env.observation_space,
+                env.action_space,
+                capacity=10000,
+                image_keys=training_image_keys,
+            )
+            load_demo_buffer(demo_buffer, training_image_keys, stage_name="stage1")
+
+            print_green("starting learner loop")
+            learner(
+                sampling_rng,
+                agent,
+                replay_buffer,
+                demo_buffer=demo_buffer,
+                stage_name="stage1",
+            )
 
     elif FLAGS.actor or FLAGS.eval:
         # Actor/Eval 模式
         sampling_rng = jax.device_put(sampling_rng, sharding)
-        data_store = QueuedDataStore(2000)  # Actor 上的队列大小
+        if FLAGS.enable_two_stage_training:
+            agents = {}
+            agents["stage1"], _ = restore_agent_from_checkpoint(
+                agent,
+                FLAGS.stage1_checkpoint_path,
+                label="stage1 actor",
+            )
+            stage2_agent = make_drq_agent(
+                seed=FLAGS.seed,
+                sample_obs=env.observation_space.sample(),
+                sample_action=env.action_space.sample(),
+                image_keys=training_image_keys,
+                encoder_type=FLAGS.encoder_type,
+            )
+            stage2_agent = jax.device_put(
+                jax.tree_util.tree_map(jnp.array, stage2_agent), sharding
+            )
+            agents["stage2"], _ = restore_agent_from_checkpoint(
+                stage2_agent,
+                FLAGS.stage2_checkpoint_path,
+                label="stage2 actor",
+                fallback_checkpoint_path=FLAGS.stage1_checkpoint_path,
+                reset_step_on_fallback=True,
+            )
+            data_store = QueuedDataStore(2000)
+        else:
+            agent, _ = restore_agent_from_checkpoint(
+                agent,
+                FLAGS.stage1_checkpoint_path,
+                label="stage1 actor/eval",
+            )
+            data_store = QueuedDataStore(2000)  # Actor 上的队列大小
         # 启动过程
         if FLAGS.eval:
              print_green("Starting evaluation...")
         else:
              print_green("Starting actor loop...")
-        actor(agent, data_store, env, sampling_rng)
+        if FLAGS.enable_two_stage_training:
+            actor(agents, data_store, env, sampling_rng)
+        else:
+            actor(agent, data_store, env, sampling_rng)
 
     else:
         raise NotImplementedError("Must be either a learner or an actor")

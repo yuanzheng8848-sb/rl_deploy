@@ -1,34 +1,42 @@
-from viser_base import ViserBase
-from robot_ik_solver import BaseIKSolver
-from vr import VRUpperBodyTeleop
-
-import numpy as np
-import time
-import yaml
+import importlib.util
+import json
+import os
 from pathlib import Path
+import pickle as pkl
+import sys
+import time
 import traceback
 from datetime import datetime
-import json
 
-from realsense_camera import RealsenseCamera
-
-# 解析解IK用的
+import cv2
+import jax
+import numpy as np
 from scipy.spatial.transform import Rotation as R
-import importlib.util
-import sys
-import os
+import yaml
+
+# Resolve project paths first so local modules still import after moving this file.
+FILE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = FILE_DIR.parents[1]
+PROJECT_ROOT = WORKSPACE_DIR.parent
+PYROKI_DIR = WORKSPACE_DIR / "pyroki"
+SERL_LAUNCHER_PARENT = PROJECT_ROOT / "serl" / "serl_launcher"
+SERL_ROBOT_INFRA_PARENT = PROJECT_ROOT / "serl" / "serl_robot_infra"
+
+for path in (PYROKI_DIR, SERL_LAUNCHER_PARENT, SERL_ROBOT_INFRA_PARENT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from data_recorder import DataRecorder
 from ik_performance_monitor import create_monitor, create_gui_components
+from realsense_camera import RealsenseCamera
+from robot_ik_solver import BaseIKSolver
+from serl_launcher.networks.reward_classifier import load_classifier_func
+from viser_base import ViserBase
+from vr import VRUpperBodyTeleop
 from workspace_constraint import create_openarm_constraint
 
-# RL Recording Imports
-import pickle as pkl
-import jax
-import cv2
-
-# Define file absolute paths
-cur_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# path of moqi_workspace
+cur_dir = str(WORKSPACE_DIR)
 IK_dir = os.path.join(cur_dir, "IK")
 file_path = os.path.join(IK_dir, "analytic_IK.py")
 # Import using importlib
@@ -37,21 +45,14 @@ ik_module = importlib.util.module_from_spec(spec_ik)
 spec_ik.loader.exec_module(ik_module)
 
 file_path = os.path.join(IK_dir, "collision_check.py")
-spec_collision = importlib.util.spec_from_file_location("analytic_IK", file_path)
+spec_collision = importlib.util.spec_from_file_location("collision_check", file_path)
 collision_module = importlib.util.module_from_spec(spec_collision)
 spec_collision.loader.exec_module(collision_module)
 
-file_path = os.path.join(cur_dir, "openarm","openarm_controller.py")
+file_path = os.path.join(cur_dir, "openarm", "openarm_controller.py")
 spec_openarm = importlib.util.spec_from_file_location("openarm_controller", file_path)
 openarm_module = importlib.util.module_from_spec(spec_openarm)
 spec_openarm.loader.exec_module(openarm_module)
-
-# SERL Path Setup
-ROOT_DIR = Path(cur_dir).parent # Desktop/zy
-sys.path.append(str(ROOT_DIR / "serl" / "serl_launcher"))
-sys.path.append(str(ROOT_DIR / "serl" / "serl_robot_infra"))
-
-from serl_launcher.networks.reward_classifier import load_classifier_func
 
 USE_VR = True
 USE_REAL = True
@@ -77,14 +78,14 @@ All pose order is qw qx qy qz x y z
 CAMERA_CONFIGS = [
     ("150622074105", 640, 480, 30),  # left
     ("236422072385", 640, 480, 30),  # right
-    (18, 640, 480, 30),  # head (USB Camera Index 18)
+    ("/dev/video10", 640, 480, 30),  # head (USB Camera Device Path)
 ]
 
 # Map serials to SERL keys
 CAM_SERIAL_TO_KEY = {
     "150622074105": "image_left",
     "236422072385": "image_right",
-    18: "image_primary", # USB Camera
+    "/dev/video10": "image_primary", # USB Camera
 }
 
 class USBCamera:
@@ -310,11 +311,11 @@ def get_relative_action(current_ee_pose, target_ee_pose):
 
 def main():
     # Original Record Dir (for DataRecorder if used)
-    record_dir = os.path.join(cur_dir, "record_data")
+    record_dir = os.path.join(cur_dir, "rl_deploy", "demo", "record_data")
     os.makedirs(record_dir, exist_ok=True)
     
     # SERL Demo Dir
-    serl_demo_dir = os.path.join(cur_dir, "bc_demos")
+    serl_demo_dir = os.path.join(cur_dir, "rl_deploy", "demo", "demos_origin")
     os.makedirs(serl_demo_dir, exist_ok=True)
 
     recorder = None
@@ -345,6 +346,9 @@ def main():
     joint_names = solver.get_actuated_joint_order()
     state_logger = create_runtime_logger(os.path.join(cur_dir, "pyroki"), joint_names)
 
+    target_pos_dir = os.path.join(cur_dir, "rl_deploy", "classifier", "target_position")
+    os.makedirs(target_pos_dir, exist_ok=True)
+
     manip_weight = viser._server.gui.add_slider("Manipulability Weight", 0.0, 10.0, 0.001, 0.0)
     limit_weight = viser._server.gui.add_slider("Limit Avoidance Weight", 0.0, 100.0, 0.01, 0.0)
     
@@ -365,7 +369,7 @@ def main():
         
         if is_recording:
             button = viser._server.gui.add_button("🔴 Stop Recording", color="red")
-            recording_state["status_text"].value = "🔴 RECORDING (RL Data)"
+            recording_state["status_text"].value = "🔴 RECORDING"
         else:
             button = viser._server.gui.add_button("⚪ Start Recording", color="white")
             recording_state["status_text"].value = "Not Recording"
@@ -464,7 +468,7 @@ def main():
     '''
     if USE_VR:
         cfg_vr = yaml.safe_load((cfgs_path / "vr.yaml").read_text())
-        ip_vr = "10.255.8.46"
+        ip_vr = "10.255.27.103"
         
         vr = VRUpperBodyTeleop(
             cfg_vr,
@@ -487,7 +491,7 @@ def main():
     if USE_CAMERA:
         for serial, width, height, fps in CAMERA_CONFIGS:
             try:
-                if isinstance(serial, int):
+                if isinstance(serial, int) or (isinstance(serial, str) and serial.startswith("/dev/video")):
                     # USB Camera
                     cam = USBCamera(device_id=serial, width=width, height=height, fps=fps)
                 else:
@@ -513,8 +517,13 @@ def main():
         # Create dummy sample for initialization
         dummy_sample = {"image_0": np.zeros((256, 256, 3), dtype=np.uint8)}
         rng = jax.random.PRNGKey(0)
-        # Use absolute path or relative to current script
-        ckpt_path = os.path.join(cur_dir, "..", "rl_deploy", "train_reward_classifier", "classifier_ckpt_cam1", "checkpoint_100")
+        ckpt_path = os.path.join(
+            cur_dir,
+            "rl_deploy",
+            "classifier",
+            "classifier_ckpt",
+            "checkpoint_100",
+        )
         classifier_func = load_classifier_func(
             key=rng,
             sample=dummy_sample,
@@ -564,19 +573,23 @@ def main():
 
             start_time = time.time()
 
-            # Handle Recording Toggle
+            # Handle Recording Toggle Request
             if recording_state["toggle_requested"]:
                 recording_state["toggle_requested"] = False
                 
                 if not is_recording:
                     # Start Recording
                     try:
+                        # 1. Setup Raw Recorder
                         recorder = DataRecorder(save_dir=os.path.join(record_dir, f"session_{time.strftime('%Y%m%d_%H%M%S')}"), save_depth=SAVE_DEPTH)
+                        
+                        # 2. Setup RL Recorder
+                        episode_transitions = []
+                        
                         is_recording = True
                         recording_state["active"] = True
-                        episode_transitions = []
                         update_record_button(True)
-                        print("🔴 Recording started (RL + Raw Data).")
+                        print("🔴 Recording started.")
                     except Exception as e:
                         print("Failed to start recording:", e)
                         recorder = None
@@ -585,62 +598,41 @@ def main():
                 else:
                     # Stop Recording
                     try:
+                        # 1. Save Raw Data
                         if recorder is not None:
                             recorder.save()
-                            print("⚪ Raw Data Recording saved.")
+                            print("⚪ Raw data saved.")
                             
-                            # Rename session directory
-                            try:
-                                session_dir = recorder.save_dir if hasattr(recorder, 'save_dir') else None
-                                if session_dir is not None:
-                                    session_dir = str(session_dir)
-                                    traj_path = os.path.join(session_dir, "trajectory.json")
-                                    if os.path.exists(traj_path):
-                                        import json
-                                        with open(traj_path, 'r') as f:
-                                            traj = json.load(f)
-                                        num_frames = len(traj)
-                                        if num_frames >= 2:
-                                            t0 = datetime.fromisoformat(traj[0]["timestamp"]) 
-                                            t1 = datetime.fromisoformat(traj[-1]["timestamp"]) 
-                                            duration = max((t1 - t0).total_seconds(), 1e-6)
-                                            fps = int(round(num_frames / duration))
-                                        else:
-                                            fps = 0
-
-                                        existing = [d for d in os.listdir(record_dir) 
-                                                    if os.path.isdir(os.path.join(record_dir, d)) and d.startswith("session_")]
-                                        session_index = len(existing) - 1
-                                        timestamp_str = time.strftime('%Y%m%d_%H%M%S')
-                                        new_name = f"session_{session_index:04d}_{fps}hz_{timestamp_str}"
-                                        new_path = os.path.join(record_dir, new_name)
-                                        if not os.path.exists(new_path):
-                                            os.rename(session_dir, new_path)
-                                            print(f"Session renamed to {new_name}")
-                            except Exception as e:
-                                print("Failed to rename session directory:", e)
-                    except Exception as e:
-                        print("Failed to save raw recording:", e)
-
-                    is_recording = False
-                    recording_state["active"] = False
-                    update_record_button(False)
-                    print("⚪ Recording stopped.")
-                    
-                    # Save RL Data
-                    if len(episode_transitions) > 0:
-                        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                        fname = f"vr_demo_{len(episode_transitions)}_steps_{timestamp}.pkl"
-                        fpath = os.path.join(serl_demo_dir, fname)
-                        try:
-                            with open(fpath, "wb") as f:
+                        # 2. Save RL Data
+                        if len(episode_transitions) > 0:
+                            timestamp = time.strftime('%Y%m%d_%H%M%S')
+                            pkl_filename = f"wd_{timestamp}.pkl" # Follows pattern wd_YYYYMMDD_HHMMSS.pkl
+                            pkl_path = os.path.join(serl_demo_dir, pkl_filename)
+                            
+                            # Handle last transition's next_observation (terminal)
+                            # Usually we mark done=True or just leave it. 
+                            # For now, we assume the episode ends here.
+                            episode_transitions[-1]["dones"] = True
+                            
+                            with open(pkl_path, 'wb') as f:
                                 pkl.dump(episode_transitions, f)
-                            print(f"Saved {len(episode_transitions)} RL transitions to {fpath}")
-                        except Exception as e:
-                            print(f"Failed to save RL data: {e}")
+                            print(f"⚪ RL transitions saved to {pkl_path} ({len(episode_transitions)} steps)")
+                            
+                    except Exception as e:
+                        print("Failed to save recording:", e)
+                        traceback.print_exc()
+                    finally:
+                        recorder = None
                         episode_transitions = []
-                    
-                    recorder = None
+                        is_recording = False
+                        recording_state["active"] = False
+                        update_record_button(False)
+                        print("⚪ Recording stopped.")
+                
+                try:
+                    pass # Placeholder for removed position saving logic
+                except Exception as e:
+                    pass
 
             # Capture Images
             current_images = {}

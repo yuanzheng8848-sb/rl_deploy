@@ -1,50 +1,91 @@
 # ----------------------------
-# Personal / editor / misc
+# Editor / personal
 # ----------------------------
-record_data*
+.vscode/
+.idea/
+.DS_Store
 1.md
-.vscode
-rl_deploy_2
-rl_deploy_backup
-*.pkl
+record_data*
 recording*
-*ckpt*
-debug_image
+debug_image/
+rl_deploy_2/
+rl_deploy_backup/
+.codex
+.codex/
 
 # ----------------------------
-# Python bytecode
+# Python cache / packaging
 # ----------------------------
 __pycache__/
 *.py[cod]
+*.egg-info/
+**/*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
 
 # ----------------------------
-# Build artifacts (C/C++)
+# Build / robotics
 # ----------------------------
 build/
 **/build/
 **/packagecache/
+devel/
+install/
+log/
 
 # ----------------------------
-# Python packaging
-# ----------------------------
-*.egg-info/
-**/*.egg-info/
-
-# ----------------------------
-# ML / RL artifacts
+# Training outputs / logs
 # ----------------------------
 wandb/
 runs/
 logs/
-checkpoints/
-*.pt
-*.pth
-*.ckpt
-*.npz
+artifacts/
+moqi_workspace/pyroki/log/
+moqi_workspace/rl_deploy/artifacts/
+moqi_workspace/rl_deploy/111/
+moqi_workspace/rl_deploy/checkpoints/
+moqi_workspace/rl_deploy/checkpoints_stage2/
+moqi_workspace/rl_deploy/classifier/classifier_ckpt/
+moqi_workspace/rl_deploy/classifier/training_logs/
+moqi_workspace/rl_deploy/classifier/extra_failure_images/
+serl/serl_launcher/serl_launcher/networks/resnet10_params.pkl
 
 # ----------------------------
-# ROS / robotics
+# Demos / backups / datasets
 # ----------------------------
-devel/
-install/
-log/
+moqi_workspace/backup_rl_deploy/
+moqi_workspace/rl_deploy/demo/demos_origin/
+moqi_workspace/rl_deploy/demo/*.pkl
+moqi_workspace/rl_deploy/demo/*.npy
+moqi_workspace/rl_deploy/demo/*.npz
+moqi_workspace/rl_deploy/demo/*.h5
+moqi_workspace/rl_deploy/demo/*.hdf5
+moqi_workspace/rl_deploy/test/data/session_*/
+moqi_workspace/rl_deploy/test/data/test_logs/
+moqi_workspace/rl_deploy/test/data/*.pkl
+moqi_workspace/rl_deploy/test/data/*.npy
+
+# ----------------------------
+# Large model / data files
+# Keep rules targeted so code and small third-party assets stay tracked.
+# ----------------------------
+moqi_workspace/**/*.pkl
+moqi_workspace/**/*.pt
+moqi_workspace/**/*.pth
+moqi_workspace/**/*.ckpt
+moqi_workspace/**/*.onnx
+moqi_workspace/**/*.engine
+moqi_workspace/**/*.npz
+moqi_workspace/**/*.bag
+moqi_workspace/**/*.zarr
+moqi_workspace/**/*.h5
+moqi_workspace/**/*.hdf5
+moqi_workspace/**/*.tar
+moqi_workspace/**/*.tar.gz
+moqi_workspace/**/*.gz
+moqi_workspace/**/*.xz
+moqi_workspace/**/*.zip

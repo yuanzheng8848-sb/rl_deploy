@@ -11,6 +11,10 @@ import os
 import copy
 import cv2
 import glob
+import time
+import matplotlib.pyplot as plt
+plt.switch_backend('Agg')
+import pandas as pd
 
 from serl_launcher.utils.train_utils import concat_batches
 from serl_launcher.vision.data_augmentations import batched_random_crop
@@ -21,11 +25,16 @@ import gym
 from gym import spaces
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string("checkpoint_path", "./classifier_ckpt", "Path to save checkpoint")
+flags.DEFINE_string("checkpoint_path", "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/classifier_ckpt", "Path to save checkpoint")
 flags.DEFINE_integer("batch_size", 64, "Batch size")
 flags.DEFINE_integer("num_epochs", 100, "Number of epochs")
 
+# 使用 demo/record_data：每 session 的 cam_2 前 10 帧=失败，后 10 帧=成功
 RECORD_DATA_DIR = "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/demo/record_data"
+CAM_SUBDIR = "cam_2_rgb"
+N_FAILURE_FRAMES = 10  # 每 session 取前 N 帧为失败
+N_SUCCESS_FRAMES = 10  # 每 session 取后 N 帧为成功
+EXTRA_FAILURE_DIR = "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/extra_failure_images"
 
 
 def populate_data_store_from_images(data_store, images):
@@ -72,6 +81,29 @@ def fix_image_shape(x):
                  raise ValueError(f"Could not fix shape {shape} to (B, 1, 128, 128, 3)")
     return x
 
+def load_extra_failure_images(extra_failure_dir):
+    images = []
+    if not os.path.exists(extra_failure_dir):
+        print(f"Extra failure image dir not found, skip: {extra_failure_dir}")
+        return images
+    patterns = ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"]
+    paths = []
+    for p in patterns:
+        paths.extend(glob.glob(os.path.join(extra_failure_dir, p)))
+    paths = sorted(paths)
+    print(f"Found {len(paths)} extra failure images in {extra_failure_dir}")
+    for path in paths:
+        try:
+            img = cv2.imread(path)
+            if img is None:
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (128, 128))
+            images.append(img[None, ...])
+        except Exception as e:
+            print(f"Error loading extra failure image {path}: {e}")
+    return images
+
 def main(_):
     STATE_DIM = 14 
     ACTION_DIM = 14 
@@ -91,95 +123,74 @@ def main(_):
     )
     
     # --- Load Data ---
+    # 规则：每个 session 下 cam_2_rgb 前 N 帧=失败，后 N 帧=成功
     success_images = []
     failure_images = []
     
     if not os.path.exists(RECORD_DATA_DIR):
         print(f"Warning: Record data dir not found: {RECORD_DATA_DIR}")
     else:
-        sessions = sorted([d for d in os.listdir(RECORD_DATA_DIR) if os.path.isdir(os.path.join(RECORD_DATA_DIR, d))])
-        
+        sessions = sorted([d for d in os.listdir(RECORD_DATA_DIR) if os.path.isdir(os.path.join(RECORD_DATA_DIR, d)) and d.startswith("session_")])
         print(f"Found {len(sessions)} sessions in {RECORD_DATA_DIR}")
+        print(f"Rule: per session cam_2_rgb first {N_FAILURE_FRAMES} frames = FAILURE, last {N_SUCCESS_FRAMES} frames = SUCCESS")
 
+        session_stats = []
         for session in sessions:
-            if session in ["success", "failure"]:
-                continue
-                
-            img_dir = os.path.join(RECORD_DATA_DIR, session, "images", "cam_1_rgb")
+            img_dir = os.path.join(RECORD_DATA_DIR, session, "images", CAM_SUBDIR)
             if not os.path.exists(img_dir):
                 continue
-                
-            # Manually glob and sort to ensure order
-            image_paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg"))) 
-            # Add other extensions if needed, but ensure sorting is correct across them if mixed
-            # For now assuming primarily jpg based on file listing check
+            image_paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
+            total = len(image_paths)
+            if total < N_FAILURE_FRAMES + N_SUCCESS_FRAMES:
+                session_stats.append((session, 0, 0, "SKIP (too few frames)"))
+                continue
 
-            current_session_images = []
-            for path in image_paths:
+            n_fail = min(N_FAILURE_FRAMES, total)
+            n_succ = min(N_SUCCESS_FRAMES, total)
+            failure_paths = image_paths[:n_fail]
+            success_paths = image_paths[-n_succ:]
+
+            for path in failure_paths:
                 try:
                     img = cv2.imread(path)
                     if img is None:
                         continue
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     img = cv2.resize(img, (128, 128))
-                    img = img[None, ...] 
-                    current_session_images.append(img)
+                    img = img[None, ...]
+                    failure_images.append(img)
+                except Exception as e:
+                    print(f"Error loading {path}: {e}")
+            for path in success_paths:
+                try:
+                    img = cv2.imread(path)
+                    if img is None:
+                        continue
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = cv2.resize(img, (128, 128))
+                    img = img[None, ...]
+                    success_images.append(img)
                 except Exception as e:
                     print(f"Error loading {path}: {e}")
 
-            if len(current_session_images) < 20:
-                 print(f"Warning: Session {session} has fewer than 20 images ({len(current_session_images)}). Skipping.")
-                 continue
-            
-            # First 30 frames -> failure
-            failure_images.extend(current_session_images[:30])
-            # Last 30 frames -> success
-            success_images.extend(current_session_images[-30:])
-            
-    # --- Load Extra Images (Success & Failure) ---
-    extra_img_dir = "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/extra_images"
-    
-    if os.path.exists(extra_img_dir):
-        print(f"Loading extra images from {extra_img_dir}...")
-        
-        # 1. Extra Success Images
-        success_img_paths = sorted(glob.glob(os.path.join(extra_img_dir, "success", "**", "*.jpg"), recursive=True))
-        count_success = 0
-        for path in success_img_paths:
-            try:
-                img = cv2.imread(path)
-                if img is None: continue
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = cv2.resize(img, (128, 128))
-                img = img[None, ...]
-                success_images.append(img)
-                count_success += 1
-            except Exception as e:
-                print(f"Error loading extra success image {path}: {e}")
-                
-        # 2. Extra Failure Images
-        failure_img_paths = sorted(glob.glob(os.path.join(extra_img_dir, "failure", "**", "*.jpg"), recursive=True))
-        count_failure = 0
-        for path in failure_img_paths:
-            try:
-                img = cv2.imread(path)
-                if img is None: continue
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                img = cv2.resize(img, (128, 128))
-                img = img[None, ...]
-                failure_images.append(img)
-                count_failure += 1
-            except Exception as e:
-                print(f"Error loading extra failure image {path}: {e}")
-                
-        print(f"Added {count_success} extra SUCCESS images.")
-        print(f"Added {count_failure} extra FAILURE images.")
+            session_stats.append((session, n_fail, n_succ, "OK"))
 
-    else:
-        print(f"Extra images directory not found: {extra_img_dir}")
+        print("\n" + "="*60)
+        print(f"{'Session':<35} | {'Fail#':<6} | {'Succ#':<6} | Status")
+        print("-" * 60)
+        for name, nf, ns, status in session_stats:
+            print(f"{name:<35} | {nf:<6} | {ns:<6} | {status}")
+        print("="*60)
 
-    print(f"Total Success Images: {len(success_images)}")
-    print(f"Total Failure Images: {len(failure_images)}")
+    extra_failure_images = load_extra_failure_images(EXTRA_FAILURE_DIR)
+    failure_images.extend(extra_failure_images)
+
+    print(f"\nSummary:")
+    print(f" - Total Success Images: {len(success_images)}")
+    print(f" - Total Failure Images: {len(failure_images)}")
+    print(f" - Extra Failure Images: {len(extra_failure_images)}")
+    print(f" - Training Batch Size:  {FLAGS.batch_size}")
+    print(f" - Total Epochs:         {FLAGS.num_epochs}")
 
     if not success_images:
         raise ValueError("No success images found.")
@@ -193,6 +204,7 @@ def main(_):
         raise ValueError("Buffers cannot be empty.")
 
     devices = jax.local_devices()
+    print(f"\nJAX Devices: {devices}")
     mesh = jax.sharding.Mesh(devices, ('batch',))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('batch'))
     
@@ -245,7 +257,21 @@ def main(_):
         return state.apply_gradients(grads=grads), loss, train_accuracy
 
     print("Starting training...")
+    logs = {
+        "epoch": [],
+        "loss": [],
+        "accuracy": [],
+        "epoch_time": [],
+        "cumulative_time": [],
+        "samples_per_second": []
+    }
+    
+    start_time = time.time()
+    cumulative_time = 0
+    
     for epoch in tqdm(range(FLAGS.num_epochs)):
+        epoch_start = time.time()
+        
         try:
             pos_sample = next(pos_iterator)
             neg_sample = next(neg_iterator)
@@ -276,8 +302,85 @@ def main(_):
         rng, key = jax.random.split(rng)
         classifier, loss, acc = train_step(classifier, batch, key)
         
+        epoch_end = time.time()
+        duration = epoch_end - epoch_start
+        cumulative_time += duration
+        
+        # Record logs
+        logs["epoch"].append(epoch)
+        logs["loss"].append(float(loss))
+        logs["accuracy"].append(float(acc))
+        logs["epoch_time"].append(duration)
+        logs["cumulative_time"].append(cumulative_time)
+        logs["samples_per_second"].append(FLAGS.batch_size / duration)
+        
         if epoch % 10 == 0:
-            tqdm.write(f"Epoch {epoch}: Loss {loss:.4f}, Acc {acc:.4f}")
+            tqdm.write(f"Epoch {epoch}: Loss {loss:.4f}, Acc {acc:.4f}, Speed {FLAGS.batch_size/duration:.1f} samples/s")
+
+    # --- Generate Visualizations ---
+    log_dir = "/home/sj/Desktop/zy/moqi_workspace/rl_deploy/classifier/training_logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+        
+    df = pd.DataFrame(logs)
+    df.to_csv(os.path.join(log_dir, "training_metrics.csv"), index=False)
+    
+    # helper for smoothing
+    def smooth(y, window=5):
+        if len(y) < window: return y
+        return np.convolve(y, np.ones(window)/window, mode='valid')
+
+    # 1. Data Distribution Pie Chart
+    plt.figure(figsize=(8, 8))
+    dist = [len(success_images), len(failure_images)]
+    plt.pie(dist, labels=['Success', 'Failure'], autopct='%1.1f%%', colors=['tab:blue', 'tab:red'], startangle=140)
+    plt.title('Training Data Distribution')
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, "data_distribution.png"))
+    plt.close()
+
+    # 2. Loss and Accuracy Curve（仅原始曲线，不做拟合/平滑）
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss', color='tab:red')
+    ax1.plot(df['epoch'], df['loss'], color='tab:red', linewidth=1.5, label='Loss')
+    ax1.tick_params(axis='y', labelcolor='tab:red')
+    
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Accuracy', color='tab:blue')
+    ax2.plot(df['epoch'], df['accuracy'], color='tab:blue', linewidth=1.5, label='Accuracy')
+    ax2.tick_params(axis='y', labelcolor='tab:blue')
+    
+    plt.title('Classifier Training: Loss and Accuracy Trends')
+    fig.tight_layout()
+    plt.savefig(os.path.join(log_dir, "loss_accuracy_curves.png"))
+    plt.close()
+    
+    # 3. Training Efficiency (Samples/s)
+    plt.figure(figsize=(10, 6))
+    plt.plot(df['epoch'], df['samples_per_second'], color='tab:green', alpha=0.4)
+    speed_smooth = smooth(df['samples_per_second'].values)
+    plt.plot(df['epoch'].values[len(df)-len(speed_smooth):], speed_smooth, color='tab:green', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Samples per Second')
+    plt.title('Classifier Training Efficiency (Throughput)')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, "training_efficiency.png"))
+    plt.close()
+    
+    # 4. Cumulative Time
+    plt.figure(figsize=(10, 6))
+    plt.plot(df['epoch'], df['cumulative_time'], color='tab:orange')
+    plt.xlabel('Epoch')
+    plt.ylabel('Cumulative Time (s)')
+    plt.title('Classifier Training: Time Accumulation')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, "cumulative_time.png"))
+    plt.close()
+    
+    print(f"\nTraining logs and {len(logs['epoch'])} epochs of data visualized in: {log_dir}")
 
     if not os.path.exists(FLAGS.checkpoint_path):
         os.makedirs(FLAGS.checkpoint_path)

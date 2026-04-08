@@ -142,6 +142,8 @@ class OpenArmEnv(gym.Env):
         
         self.curr_gripper_pos = np.zeros((2,))
         self.gripper_binary_state = np.zeros((2,), dtype=int) # 0:开, 1:闭
+        self.gripper_open_threshold = -0.3
+        self.gripper_close_threshold = 0.3
         
         self.curr_path_length = 0
         self.cycle_count = 0
@@ -269,14 +271,7 @@ class OpenArmEnv(gym.Env):
             rot_curr = Rotation.from_quat(self.nextpos[i, 3:])
             self.nextpos[i, 3:] = (rot_delta * rot_curr).as_quat()
             
-            # 3. 夹爪控制 (Continuous)
-            raw_gripper_action = current_arm_action[6]
-            gripper_val = 0.5236 * (raw_gripper_action - 1.0)
-            
-            # Store gripper command for this arm
-            # We need to ensure gripper_cmds has 2 elements eventually
-            # So we better initialize gripper_cmds with current state and update
-            pass 
+            # 3. 夹爪控制由下面的统一二值状态机构建
 
         # Re-construct gripper commands for BOTH arms
         # If an arm is not active, we should keep its gripper at current state?
@@ -295,7 +290,11 @@ class OpenArmEnv(gym.Env):
                     act = action
                 
                 raw_val = act[6]
-                val = 0.5236 * (raw_val - 1.0)
+                if raw_val >= self.gripper_close_threshold:
+                    self.gripper_binary_state[i] = 1
+                elif raw_val <= self.gripper_open_threshold:
+                    self.gripper_binary_state[i] = 0
+                val = 0.0 if self.gripper_binary_state[i] == 1 else -1.0472
                 final_gripper_cmds.append(val)
             else:
                 # Inactive arm: Enforce holding the initial reset pose to prevent drift
@@ -444,6 +443,11 @@ class OpenArmEnv(gym.Env):
         Deprecated: Gripper is now handled in _send_pos_command
         """
         return False
+
+    def refresh_obs(self) -> dict:
+        """Refresh state from server without issuing a new motion command."""
+        self._update_currpos()
+        return self._get_obs()
 
     def _update_currpos(self):
         """从服务器获取最新状态并更新内部变量"""

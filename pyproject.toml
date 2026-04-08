@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-deploy"
+version = "0.1.0"
+description = "OpenArm RL deploy and data tooling"
+requires-python = ">=3.10"
+
+[project.scripts]
+rl-deploy-train = "rl_deploy.cli.train:main"
+rl-deploy-server = "rl_deploy.cli.server:main"
+rl-deploy-classifier-train = "rl_deploy.cli.classifier_train:main"
+rl-deploy-classifier-eval = "rl_deploy.cli.classifier_eval:main"
+rl-deploy-process-demos = "rl_deploy.cli.process_demos:main"
+rl-deploy-record-demo = "rl_deploy.cli.record_demo:main"
+
+[tool.setuptools]
+package-dir = {"" = "moqi_workspace"}
+
+[tool.setuptools.packages.find]
+where = ["moqi_workspace"]
+include = ["rl_deploy*"]

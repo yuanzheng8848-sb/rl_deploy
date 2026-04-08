@@ -8,6 +8,8 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 import cv2
 import base64
+from scipy.spatial.transform import Rotation
+import importlib.util
 
 # --- 配置 ---
 USE_MOCK = False  # Set to True to use Mock Hardware, False for Real Hardware
@@ -69,14 +71,48 @@ class OpenArmServer:
         # 用于线程安全的锁 (虽然 Flask 是多线程的，但 CAN 通讯通常不是线程安全的)
         self.lock = threading.Lock()
         self.camera_lock = threading.Lock()
+        self.servo_lock = threading.Lock()
         self.latest_frames = {}
+        self.running = True
+
+        # Opt-in real-time servo state. Disabled by default to preserve training behavior.
+        self.servo_enabled = False
+        self.servo_hz = 80.0
+        self.servo_trans_step = 0.004
+        self.servo_rot_step = 0.012
+        self.servo_gripper_step = 0.02
+        self.servo_timeout = 0.25
+        self.servo_pos_epsilon = 5e-4
+        self.servo_rot_epsilon = 1e-2
+        self.servo_target_pose = None
+        self.servo_target_gripper = None
+        self.servo_last_update_ts = 0.0
+        self.servo_active_arms = (0, 1)
+        self.servo_backend = "analytic"
+        self.servo_debug = {
+            "status": "idle",
+            "last_error": "",
+            "last_backend": "baseik",
+            "last_active_arms": (0, 1),
+            "last_target_pose": None,
+            "last_current_pose": None,
+            "last_q_target": None,
+            "last_current_gripper": None,
+            "last_target_gripper": None,
+            "last_stepped_gripper": None,
+            "last_update_ts": 0.0,
+            "solve_fail_count": 0,
+            "command_count": 0,
+        }
+        self.last_servo_log_ts = 0.0
+        self.servo_thread = threading.Thread(target=self._servo_loop, daemon=True)
+        self.servo_thread.start()
         
         # Initialize Cameras
         self.cameras = {}
         if not USE_MOCK:
             self._init_cameras()
             # Start camera thread
-            self.running = True
             self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
             self.camera_thread.start()
 
@@ -121,12 +157,77 @@ class OpenArmServer:
             print(f"[Server Warning] IK/Viser Init Failed: {e}")
             self.ik_solver = None
             self.viser = None
+        self._init_analytic_servo()
+
+    def _init_analytic_servo(self):
+        """Initialize the VR-style analytic IK stack used by record_demo."""
+        self.analytic_servo_ready = False
+        self.analytic_triangle = None
+        self.analytic_workspace_constraint = None
+        self.analytic_collision_checker = None
+        self.analytic_left_shoulder_position = None
+        self.analytic_right_shoulder_position = None
+        self.analytic_left_shoulder_orientation = None
+        self.analytic_right_shoulder_orientation = None
+        self.analytic_joints_upper_limit = None
+        self.analytic_joints_lower_limit = None
+
+        if not self.ik_solver:
+            return
+
+        try:
+            pyroki_dir = ROOT_DIR / "pyroki"
+            if str(pyroki_dir) not in sys.path:
+                sys.path.insert(0, str(pyroki_dir))
+            from workspace_constraint import create_openarm_constraint
+
+            def _load_module(module_name: str, path: Path):
+                spec = importlib.util.spec_from_file_location(module_name, str(path))
+                module = importlib.util.module_from_spec(spec)
+                assert spec.loader is not None
+                spec.loader.exec_module(module)
+                return module
+
+            ik_module = _load_module("analytic_IK_runtime", ROOT_DIR / "IK" / "analytic_IK.py")
+            collision_module = _load_module("collision_check_runtime", ROOT_DIR / "IK" / "collision_check.py")
+
+            origin_position = np.array([0.0, 0.0, 0.0])
+            l1 = 0.22
+            l2 = 0.216
+            self.analytic_triangle = ik_module.Triangle(l1, l2, origin_position)
+            current_ee_pose = self.ik_solver.get_current_ee_pose(np.zeros(14))
+            self.analytic_triangle.set_init_ee_pose(current_ee_pose[0], current_ee_pose[1])
+            self.analytic_workspace_constraint = create_openarm_constraint(l1=l1, l2=l2, safety_margin=0.016)
+
+            T = self.ik_solver.forward_kinematics(np.zeros(14))
+            left_shoulder_position = T[3][4:].copy()
+            left_shoulder_position[1] += T[4][4:][1] - T[3][4:][1]
+            right_shoulder_position = T[11][4:].copy()
+            right_shoulder_position[1] += T[12][4:][1] - T[11][4:][1]
+            shoulder_rot = Rotation.from_matrix(np.array([[0, -1, 0], [0, 0, 1], [-1, 0, 0]]))
+
+            self.analytic_left_shoulder_position = left_shoulder_position
+            self.analytic_right_shoulder_position = right_shoulder_position
+            self.analytic_left_shoulder_orientation = shoulder_rot
+            self.analytic_right_shoulder_orientation = shoulder_rot
+            self.analytic_collision_checker = collision_module.OpenArmCollisionChecker(
+                left_shoulder_position,
+                right_shoulder_position,
+                None,
+            )
+            self.analytic_joints_upper_limit = np.array(self.ik_solver._robot.joints.upper_limits) + 0.0001
+            self.analytic_joints_lower_limit = np.array(self.ik_solver._robot.joints.lower_limits) - 0.0001
+            self.analytic_servo_ready = True
+            print("[Server] Analytic servo backend ready.")
+        except Exception as e:
+            print(f"[Server Warning] Analytic servo init failed: {e}")
+            self.analytic_servo_ready = False
 
     def _init_cameras(self):
         """Initialize Realsense Cameras"""
         # Camera Configs
         self.cam_configs = {
-            "head": {"type": "opencv", "device_id": "/dev/video12", "width": 1280, "height": 960, "fps": 30, "exposure": 150},
+            "head": {"type": "opencv", "device_id": "/dev/video10", "width": 1280, "height": 960, "fps": 30, "exposure": 150},
             "left": {"type": "realsense", "serial": "150622074105", "width": 640, "height": 480, "fps": 30},
             "right": {"type": "realsense", "serial": "236422072385", "width": 640, "height": 480, "fps": 30}
         }
@@ -168,6 +269,380 @@ class OpenArmServer:
                     with self.camera_lock:
                         self.latest_frames[name] = img
             time.sleep(0.01)
+
+    def _get_current_joint_and_gripper(self):
+        with self.lock:
+            q_l_curr, g_l_curr = self.controller.get_left_position()
+            q_r_curr, g_r_curr = self.controller.get_right_position()
+
+        if q_l_curr is None:
+            q_l_curr = np.zeros(7)
+        if q_r_curr is None:
+            q_r_curr = np.zeros(7)
+        if not g_l_curr:
+            g_l_curr = [0.0]
+        if not g_r_curr:
+            g_r_curr = [0.0]
+        q_curr = np.concatenate([q_l_curr, q_r_curr])
+        g_curr = np.array([g_l_curr[0], g_r_curr[0]], dtype=np.float64)
+        return q_curr, g_curr
+
+    def _get_current_pose(self, q_curr):
+        pose = np.zeros((2, 7), dtype=np.float64)
+        if self.ik_solver:
+            ik_poses = self.ik_solver.get_current_ee_pose(q_curr)
+            for i in range(2):
+                p = ik_poses[i]
+                pose[i, :3] = p[4:7]
+                pose[i, 3:6] = p[1:4]
+                pose[i, 6] = p[0]
+        return pose
+
+    def _step_pose_towards_target(self, current_pose, target_pose):
+        next_pose = np.array(current_pose, copy=True)
+        for i in range(2):
+            pos_delta = target_pose[i, :3] - current_pose[i, :3]
+            pos_norm = np.linalg.norm(pos_delta)
+            if pos_norm > self.servo_trans_step and pos_norm > 1e-9:
+                pos_delta = pos_delta * (self.servo_trans_step / pos_norm)
+            next_pose[i, :3] = current_pose[i, :3] + pos_delta
+
+            rot_curr = Rotation.from_quat(current_pose[i, 3:])
+            rot_tgt = Rotation.from_quat(target_pose[i, 3:])
+            rot_err = rot_curr.inv() * rot_tgt
+            rotvec = rot_err.as_rotvec()
+            rot_mag = np.linalg.norm(rotvec)
+            if rot_mag > self.servo_rot_step and rot_mag > 1e-9:
+                rotvec = rotvec * (self.servo_rot_step / rot_mag)
+            next_pose[i, 3:] = (rot_curr * Rotation.from_rotvec(rotvec)).as_quat()
+        return next_pose
+
+    def _pose_error_small(self, current_pose, target_pose, active_arms):
+        for arm_idx in active_arms:
+            pos_err = np.linalg.norm(target_pose[arm_idx, :3] - current_pose[arm_idx, :3])
+            rot_curr = Rotation.from_quat(current_pose[arm_idx, 3:])
+            rot_tgt = Rotation.from_quat(target_pose[arm_idx, 3:])
+            rot_err = (rot_curr.inv() * rot_tgt).magnitude()
+            if pos_err > self.servo_pos_epsilon or rot_err > self.servo_rot_epsilon:
+                return False
+        return True
+
+    def _gripper_error_small(self, current_gripper, target_gripper, active_arms):
+        for arm_idx in active_arms:
+            if abs(target_gripper[arm_idx] - current_gripper[arm_idx]) > self.servo_gripper_step:
+                return False
+        return True
+
+    def _step_gripper_towards_target(self, current_gripper, target_gripper, active_arms):
+        next_gripper = np.array(current_gripper, copy=True)
+        for i in range(2):
+            # Right-arm-only teleop: send the right gripper command directly so it can
+            # overcome static friction and match the VR path more closely.
+            if tuple(active_arms) == (1,) and i == 1:
+                next_gripper[i] = target_gripper[i]
+                continue
+            delta = target_gripper[i] - current_gripper[i]
+            if abs(delta) > self.servo_gripper_step:
+                delta = np.sign(delta) * self.servo_gripper_step
+            next_gripper[i] = current_gripper[i] + delta
+        return next_gripper
+
+    def _pose_to_ik_target(self, pose):
+        target_ik = np.zeros((2, 7), dtype=np.float64)
+        for i in range(2):
+            target_ik[i, 0] = pose[i, 6]
+            target_ik[i, 1:4] = pose[i, 3:6]
+            target_ik[i, 4:7] = pose[i, :3]
+        return target_ik
+
+    def _analytic_solve(self, q_curr, target_pose, active_arms):
+        if not self.analytic_servo_ready:
+            self._update_servo_debug(status="analytic_not_ready", error="analytic backend not ready")
+            return None
+
+        current_pose_ik = self.ik_solver.get_current_ee_pose(q_curr)
+        self.analytic_triangle.set_init_ee_pose(
+            np.array(current_pose_ik[0], copy=True),
+            np.array(current_pose_ik[1], copy=True),
+        )
+
+        target_ik = self._pose_to_ik_target(target_pose)
+        for arm_idx in range(2):
+            if arm_idx not in active_arms:
+                target_ik[arm_idx] = current_pose_ik[arm_idx]
+
+        left_constrained, right_constrained = self.analytic_workspace_constraint.constrain_dual_arm(
+            target_ik[0],
+            target_ik[1],
+            self.analytic_left_shoulder_position,
+            self.analytic_right_shoulder_position,
+        )
+
+        solved, left_arm_cmd, right_arm_cmd = self.analytic_triangle.solve(
+            self.analytic_left_shoulder_position,
+            self.analytic_left_shoulder_orientation,
+            self.analytic_right_shoulder_position,
+            self.analytic_right_shoulder_orientation,
+            [left_constrained, right_constrained],
+            self.analytic_collision_checker,
+            self.analytic_joints_lower_limit,
+            self.analytic_joints_upper_limit,
+        )
+        if not solved:
+            self._update_servo_debug(
+                status="analytic_solve_failed",
+                error="Triangle.solve returned unsolved",
+                target_pose=target_pose,
+                current_pose=self._get_current_pose(q_curr),
+            )
+            return None
+
+        q_target = np.array(q_curr, copy=True)
+        if 0 in active_arms and left_arm_cmd is not None:
+            q_target[:7] = left_arm_cmd
+        if 1 in active_arms and right_arm_cmd is not None:
+            q_target[7:] = right_arm_cmd
+        return q_target
+
+    def _update_servo_debug(
+        self,
+        status=None,
+        error=None,
+        backend=None,
+        active_arms=None,
+        target_pose=None,
+        current_pose=None,
+        q_target=None,
+        current_gripper=None,
+        target_gripper=None,
+        stepped_gripper=None,
+        solve_fail_delta=0,
+        command_delta=0,
+    ):
+        with self.servo_lock:
+            if status is not None:
+                self.servo_debug["status"] = status
+            if error is not None:
+                self.servo_debug["last_error"] = error
+            if backend is not None:
+                self.servo_debug["last_backend"] = backend
+            if active_arms is not None:
+                self.servo_debug["last_active_arms"] = tuple(active_arms)
+            if target_pose is not None:
+                self.servo_debug["last_target_pose"] = np.array(target_pose, copy=True)
+            if current_pose is not None:
+                self.servo_debug["last_current_pose"] = np.array(current_pose, copy=True)
+            if q_target is not None:
+                self.servo_debug["last_q_target"] = np.array(q_target, copy=True)
+            if current_gripper is not None:
+                self.servo_debug["last_current_gripper"] = np.array(current_gripper, copy=True)
+            if target_gripper is not None:
+                self.servo_debug["last_target_gripper"] = np.array(target_gripper, copy=True)
+            if stepped_gripper is not None:
+                self.servo_debug["last_stepped_gripper"] = np.array(stepped_gripper, copy=True)
+            self.servo_debug["solve_fail_count"] += int(solve_fail_delta)
+            self.servo_debug["command_count"] += int(command_delta)
+            self.servo_debug["last_update_ts"] = time.time()
+
+    def _maybe_log_servo_debug(self):
+        now = time.time()
+        if now - self.last_servo_log_ts < 0.5:
+            return
+        self.last_servo_log_ts = now
+        with self.servo_lock:
+            dbg = dict(self.servo_debug)
+        target_pose = dbg.get("last_target_pose")
+        current_pose = dbg.get("last_current_pose")
+        current_gripper = dbg.get("last_current_gripper")
+        target_gripper = dbg.get("last_target_gripper")
+        stepped_gripper = dbg.get("last_stepped_gripper")
+        tgt_xyz = None if target_pose is None else np.round(np.array(target_pose)[list(dbg["last_active_arms"])[-1], :3], 4).tolist()
+        cur_xyz = None if current_pose is None else np.round(np.array(current_pose)[list(dbg["last_active_arms"])[-1], :3], 4).tolist()
+        print(
+            "[ServoDebug] "
+            f"status={dbg['status']} backend={dbg['last_backend']} active_arms={dbg['last_active_arms']} "
+            f"fails={dbg['solve_fail_count']} cmds={dbg['command_count']} "
+            f"target_xyz={tgt_xyz} current_xyz={cur_xyz} "
+            f"gripper_cur={None if current_gripper is None else np.round(np.array(current_gripper), 4).tolist()} "
+            f"gripper_tgt={None if target_gripper is None else np.round(np.array(target_gripper), 4).tolist()} "
+            f"gripper_step={None if stepped_gripper is None else np.round(np.array(stepped_gripper), 4).tolist()} "
+            f"error={dbg['last_error']}"
+        )
+
+    def _servo_loop(self):
+        print("Starting Servo Loop...")
+        while self.running:
+            time.sleep(max(1.0 / self.servo_hz, 0.001))
+
+            with self.servo_lock:
+                enabled = self.servo_enabled
+                target_pose = None if self.servo_target_pose is None else np.array(self.servo_target_pose, copy=True)
+                target_gripper = None if self.servo_target_gripper is None else np.array(self.servo_target_gripper, copy=True)
+                last_update_ts = self.servo_last_update_ts
+                active_arms = tuple(self.servo_active_arms)
+                backend = self.servo_backend
+
+            if not enabled or target_pose is None or not self.ik_solver:
+                continue
+
+            q_curr, g_curr = self._get_current_joint_and_gripper()
+            current_pose = self._get_current_pose(q_curr)
+            self._update_servo_debug(
+                status="target_received",
+                backend=backend,
+                active_arms=active_arms,
+                target_pose=target_pose,
+                current_pose=current_pose,
+                current_gripper=g_curr,
+                target_gripper=target_gripper,
+            )
+
+            if time.time() - last_update_ts > self.servo_timeout:
+                target_pose = current_pose
+                target_gripper = g_curr
+            elif target_gripper is None:
+                target_gripper = g_curr
+
+            pose_is_small = self._pose_error_small(current_pose, target_pose, active_arms)
+            grip_is_small = self._gripper_error_small(g_curr, target_gripper, active_arms)
+            if pose_is_small and grip_is_small:
+                self._update_servo_debug(
+                    status="pose_and_gripper_already_satisfied",
+                    backend=backend,
+                    active_arms=active_arms,
+                    target_pose=target_pose,
+                    current_pose=current_pose,
+                    current_gripper=g_curr,
+                    target_gripper=target_gripper,
+                )
+                continue
+
+            if backend == "analytic":
+                stepped_pose = np.array(target_pose, copy=True)
+            else:
+                stepped_pose = np.array(current_pose, copy=True) if pose_is_small else self._step_pose_towards_target(current_pose, target_pose)
+            stepped_gripper = self._step_gripper_towards_target(g_curr, target_gripper, active_arms)
+            inactive_arms = [idx for idx in range(2) if idx not in active_arms]
+            for arm_idx in inactive_arms:
+                stepped_pose[arm_idx] = current_pose[arm_idx]
+            if backend == "analytic":
+                q_target = self._analytic_solve(q_curr, stepped_pose, active_arms)
+            else:
+                target_ik = self._pose_to_ik_target(stepped_pose)
+                q_target = self.ik_solver.solve_ik(target_ik, q_curr)
+            if q_target is None or np.any(np.isnan(q_target)):
+                self._update_servo_debug(
+                    status="solve_failed",
+                    error="q_target is None or NaN",
+                    backend=backend,
+                    active_arms=active_arms,
+                    target_pose=stepped_pose,
+                    current_pose=current_pose,
+                    current_gripper=g_curr,
+                    target_gripper=target_gripper,
+                    stepped_gripper=stepped_gripper,
+                    solve_fail_delta=1,
+                )
+                self._maybe_log_servo_debug()
+                continue
+
+            with self.lock:
+                if 0 in active_arms:
+                    self.controller.set_left_position(q_target[:7], float(stepped_gripper[0]), q_curr[:7], float(g_curr[0]))
+                if 1 in active_arms:
+                    self.controller.set_right_position(q_target[7:], float(stepped_gripper[1]), q_curr[7:], float(g_curr[1]))
+            self._update_servo_debug(
+                status="command_sent",
+                backend=backend,
+                active_arms=active_arms,
+                target_pose=stepped_pose,
+                current_pose=current_pose,
+                q_target=q_target,
+                current_gripper=g_curr,
+                target_gripper=target_gripper,
+                stepped_gripper=stepped_gripper,
+                command_delta=1,
+            )
+            self._maybe_log_servo_debug()
+
+            if self.viser:
+                vis_joints = np.array(q_curr, copy=True)
+                if 0 in active_arms:
+                    vis_joints[:7] = q_target[:7]
+                if 1 in active_arms:
+                    vis_joints[7:] = q_target[7:]
+                self.viser.update_joints(vis_joints)
+
+    def start_servo(
+        self,
+        target_pose_flat=None,
+        gripper_pos=None,
+        servo_hz=80.0,
+        trans_step=0.004,
+        rot_step=0.012,
+        gripper_step=0.02,
+        arm="both",
+        backend="analytic",
+    ):
+        if not self.ik_solver:
+            print("[Server] Cannot start servo: No solver initialized.")
+            return False
+        if backend == "analytic" and not self.analytic_servo_ready:
+            print("[Server] Cannot start analytic servo: backend not ready.")
+            return False
+
+        q_curr, g_curr = self._get_current_joint_and_gripper()
+        current_pose = self._get_current_pose(q_curr)
+
+        if target_pose_flat is None:
+            target_pose = current_pose
+        else:
+            target_pose = np.array(target_pose_flat, dtype=np.float64).reshape(2, 7)
+
+        if gripper_pos is None:
+            target_gripper = g_curr
+        else:
+            target_gripper = np.array(gripper_pos, dtype=np.float64)
+
+        active_arms_map = {"left": (0,), "right": (1,), "both": (0, 1)}
+        active_arms = active_arms_map.get(str(arm).lower())
+        if active_arms is None:
+            print(f"[Server] Invalid servo arm: {arm}")
+            return False
+
+        with self.servo_lock:
+            self.servo_enabled = True
+            self.servo_hz = float(servo_hz)
+            self.servo_trans_step = float(trans_step)
+            self.servo_rot_step = float(rot_step)
+            self.servo_gripper_step = float(gripper_step)
+            self.servo_target_pose = target_pose
+            self.servo_target_gripper = target_gripper
+            self.servo_last_update_ts = time.time()
+            self.servo_active_arms = active_arms
+            self.servo_backend = str(backend).lower()
+        return True
+
+    def update_servo_target(self, target_pose_flat, gripper_pos=None):
+        target_pose = np.array(target_pose_flat, dtype=np.float64).reshape(2, 7)
+        with self.servo_lock:
+            if not self.servo_enabled:
+                return False
+            self.servo_target_pose = target_pose
+            if gripper_pos is not None:
+                self.servo_target_gripper = np.array(gripper_pos, dtype=np.float64)
+            self.servo_last_update_ts = time.time()
+        return True
+
+    def stop_servo(self):
+        with self.servo_lock:
+            self.servo_enabled = False
+            self.servo_target_pose = None
+            self.servo_target_gripper = None
+            self.servo_last_update_ts = 0.0
+            self.servo_active_arms = (0, 1)
+            self.servo_backend = "analytic"
+        return True
 
     def get_state(self):
         """获取机器人状态 (包含图像)"""
@@ -440,6 +915,61 @@ def route_move_joints():
         return "Fail", 500
     except Exception as e:
         print(f"[API Error] move_joints: {e}")
+        return str(e), 500
+
+
+@app.route("/servo/start", methods=["POST"])
+def route_servo_start():
+    try:
+        payload = request.json or {}
+        arr = payload.get("arr")
+        gripper = payload.get("gripper")
+        servo_hz = payload.get("servo_hz", 80.0)
+        trans_step = payload.get("trans_step", 0.012)
+        rot_step = payload.get("rot_step", 0.008)
+        gripper_step = payload.get("gripper_step", 0.02)
+        arm = payload.get("arm", "both")
+        backend = payload.get("backend", "baseik")
+        if server.start_servo(
+            arr,
+            gripper_pos=gripper,
+            servo_hz=servo_hz,
+            trans_step=trans_step,
+            rot_step=rot_step,
+            gripper_step=gripper_step,
+            arm=arm,
+            backend=backend,
+        ):
+            return "OK", 200
+        return "Servo Start Fail", 500
+    except Exception as e:
+        print(f"[API Error] servo/start: {e}")
+        return str(e), 500
+
+
+@app.route("/servo/target", methods=["POST"])
+def route_servo_target():
+    try:
+        payload = request.json or {}
+        arr = payload.get("arr")
+        gripper = payload.get("gripper")
+        if arr is None:
+            return "Missing array", 400
+        if server.update_servo_target(arr, gripper_pos=gripper):
+            return "OK", 200
+        return "Servo Not Enabled", 409
+    except Exception as e:
+        print(f"[API Error] servo/target: {e}")
+        return str(e), 500
+
+
+@app.route("/servo/stop", methods=["POST"])
+def route_servo_stop():
+    try:
+        server.stop_servo()
+        return "OK", 200
+    except Exception as e:
+        print(f"[API Error] servo/stop: {e}")
         return str(e), 500
 
 

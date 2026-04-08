@@ -110,10 +110,8 @@ class OpenArmCollisionChecker:
         self.A_right = A_right
         self.AC_radius = 0.03
         self.BC_radius = 0.03
+        self.viser_server = viser_server
 
-        if viser_server:
-            self.viser_server = viser_server
-        
     def draw_capsule_in_viser(self, start_point, end_point, radius, name_space, color=(255, 0, 0)):
         # 计算胶囊体的方向和长度
         direction = np.array(end_point) - np.array(start_point)

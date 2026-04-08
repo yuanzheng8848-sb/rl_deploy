@@ -11,3 +11,6 @@ sudo ip link set can0 up
 -1 - 0.05
 
 0 - 1
+
+lsusb | grep DM
+ls /dev/ttyACM*

@@ -13,6 +13,22 @@ import wandb
 from flax.core import frozen_dict
 
 
+def _tree_to_host_numpy(tree):
+    return jax.tree.map(lambda x: np.asarray(jax.device_get(x)), tree)
+
+
+def _load_pickle_on_cpu(file_obj):
+    cpu_device = jax.devices("cpu")[0]
+    with jax.default_device(cpu_device):
+        return pkl.load(file_obj)
+
+
+def _load_pickle_with_compat_mode(file_obj):
+    if os.environ.get("SERL_FORCE_CPU_RESNET_PICKLE_LOAD", "0") == "1":
+        return _tree_to_host_numpy(_load_pickle_on_cpu(file_obj))
+    return pkl.load(file_obj)
+
+
 def concat_batches(offline_batch, online_batch, axis=1):
     batch = defaultdict(list)
 
@@ -74,7 +90,7 @@ def load_resnet10_params(agent, image_keys=("image",), public=True):
     file_name = "resnet10_params.pkl"
     if not public:  # if github repo is not public, load from local file
         with open(file_name, "rb") as f:
-            encoder_params = pkl.load(f)
+            encoder_params = _load_pickle_with_compat_mode(f)
     else:  # when repo is released, download from url
         # Construct the full path to the file
         file_path = os.path.expanduser("~/.serl/")
@@ -118,7 +134,7 @@ def load_resnet10_params(agent, image_keys=("image",), public=True):
         jax_core.ShapedArray.__init__ = patched_init
         try:
             with open(file_path, "rb") as f:
-                encoder_params = pkl.load(f)
+                encoder_params = _load_pickle_with_compat_mode(f)
         finally:
             # Restore original init
             jax_core.ShapedArray.__init__ = original_init
