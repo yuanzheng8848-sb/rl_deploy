@@ -1,11 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-python train_pick_place.py \
+PYTHON_BIN="${PYTHON_BIN:-/home/sj/miniconda3/envs/zy/bin/python}"
+
+# Usage: ./run_learner.sh [additional args...]
+#
+# Training mode: bimanual, keyboard-only rewards (SPACE=fail, ENTER=success)
+# Optionally load a BC checkpoint as initialization:
+#   --checkpoint_path=./checkpoints_bc  (loads BC warmup)
+#
+# Or continue RL training from RL checkpoint:
+#   --checkpoint_path=./checkpoints_rl
+
+"${PYTHON_BIN}" train.py \
   --learner \
-  --exp_name=openarm_rl_test \
-  --training_starts=100 \
-  --demo_pkl_variant=v2 \
-  --demo_drop_over_limit_transitions
+  "$@"

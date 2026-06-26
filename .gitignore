@@ -1,91 +1,147 @@
 # ----------------------------
-# Editor / personal
+# Local editor / agent state
 # ----------------------------
 .vscode/
 .idea/
+.claude/
+.codex/
+.agents/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+
+# Temporary notes and ad-hoc recordings
 1.md
 record_data*
 recording*
 debug_image/
-rl_deploy_2/
-rl_deploy_backup/
-.codex
-.codex/
+comparison_output/
+
+# Images / generated visual artifacts
+*.bmp
+*.gif
+*.ico
+*.jpeg
+*.jpg
+*.png
+*.tif
+*.tiff
+*.webp
+*.svg
 
 # ----------------------------
 # Python cache / packaging
 # ----------------------------
 __pycache__/
 *.py[cod]
-*.egg-info/
-**/*.egg-info/
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+**/*.egg-info/
+pip-wheel-metadata/
+dist/
+
+# Virtual environments
 .venv/
 venv/
 env/
+ENV/
 
 # ----------------------------
-# Build / robotics
+# C/C++ / CMake / Meson / ROS builds
 # ----------------------------
 build/
 **/build/
+cmake-build-*/
+compile_commands.json
+.cache/
+.ninja_*
+meson-logs/
+meson-private/
+subprojects/packagecache/
 **/packagecache/
 devel/
 install/
 log/
 
 # ----------------------------
-# Training outputs / logs
+# Training logs / experiment outputs
 # ----------------------------
 wandb/
 runs/
 logs/
 artifacts/
+outputs/
+tmp/
+temp/
+
+**/checkpoints/
+**/checkpoints_*/
+**/checkpoint_*/
+**/classifier_ckpt/
+**/classifier_ckpt*/
+**/training_logs/
+**/extra_failure_images/
+
 moqi_workspace/pyroki/log/
 moqi_workspace/rl_deploy/artifacts/
 moqi_workspace/rl_deploy/111/
-moqi_workspace/rl_deploy/checkpoints/
-moqi_workspace/rl_deploy/checkpoints_stage2/
-moqi_workspace/rl_deploy/classifier/classifier_ckpt/
-moqi_workspace/rl_deploy/classifier/training_logs/
-moqi_workspace/rl_deploy/classifier/extra_failure_images/
-serl/serl_launcher/serl_launcher/networks/resnet10_params.pkl
+
+# Simulator runtime dumps
+MJDATA.TXT
+mjmodel.xml
 
 # ----------------------------
-# Demos / backups / datasets
+# Demos / datasets / generated media
 # ----------------------------
 moqi_workspace/backup_rl_deploy/
-moqi_workspace/rl_deploy/demo/demos_origin/
-moqi_workspace/rl_deploy/demo/*.pkl
-moqi_workspace/rl_deploy/demo/*.npy
-moqi_workspace/rl_deploy/demo/*.npz
-moqi_workspace/rl_deploy/demo/*.h5
-moqi_workspace/rl_deploy/demo/*.hdf5
-moqi_workspace/rl_deploy/test/data/session_*/
-moqi_workspace/rl_deploy/test/data/test_logs/
-moqi_workspace/rl_deploy/test/data/*.pkl
-moqi_workspace/rl_deploy/test/data/*.npy
+rl_deploy_2/
+rl_deploy_backup/
+
+**/demo/collected/
+**/demo/raw_images/
+**/demo/demos_origin/
+**/examples/experiments/*/demo/
+**/examples/experiments/*/bc_eval/
+**/examples/experiments/*/bc_eval*backup*/
+**/test/data/session_*/
+**/test/data/test_logs/
+
+*.bag
+*.db3
+*.mcap
+*.zarr
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
 
 # ----------------------------
-# Large model / data files
-# Keep rules targeted so code and small third-party assets stay tracked.
+# Archives / large generated artifacts
 # ----------------------------
-moqi_workspace/**/*.pkl
-moqi_workspace/**/*.pt
-moqi_workspace/**/*.pth
-moqi_workspace/**/*.ckpt
-moqi_workspace/**/*.onnx
-moqi_workspace/**/*.engine
-moqi_workspace/**/*.npz
-moqi_workspace/**/*.bag
-moqi_workspace/**/*.zarr
-moqi_workspace/**/*.h5
-moqi_workspace/**/*.hdf5
-moqi_workspace/**/*.tar
-moqi_workspace/**/*.tar.gz
-moqi_workspace/**/*.gz
-moqi_workspace/**/*.xz
-moqi_workspace/**/*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.xz
+*.zip
+*.7z
+
+# ----------------------------
+# OS / office lock files
+# ----------------------------
+.~lock.*#

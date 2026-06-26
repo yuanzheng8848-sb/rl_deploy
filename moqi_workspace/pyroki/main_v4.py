@@ -383,7 +383,7 @@ def main():
     '''
     if USE_VR:
         cfg_vr = yaml.safe_load((cfgs_path / "vr.yaml").read_text())
-        ip_vr = "10.255.8.46"
+        ip_vr = "10.255.20.244"
         
         vr = VRUpperBodyTeleop(
             cfg_vr,

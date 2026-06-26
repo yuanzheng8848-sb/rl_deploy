@@ -53,6 +53,12 @@ flags.DEFINE_integer("replay_buffer_capacity", 200000, "Replay buffer capacity."
 flags.DEFINE_integer("random_steps", 300, "Sample random actions for this many steps.")
 flags.DEFINE_integer("training_starts", 300, "Training starts after this step.")
 flags.DEFINE_integer("steps_per_update", 30, "Number of steps per update the server.")
+flags.DEFINE_float(
+    "actor_max_step_hz",
+    0.0,
+    "Throttle the actor to at most this many env steps per second (0 = unlimited). "
+    "Use this to test how the actor data-collection rate affects learning.",
+)
 
 flags.DEFINE_integer("log_period", 10, "Logging period.")
 flags.DEFINE_integer("eval_period", 2000, "Evaluation period.")
@@ -120,7 +126,12 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
     timer = Timer()
     running_return = 0.0
 
+    # Optional throttling: limit the actor to at most actor_max_step_hz env
+    # steps per second so we can study how data-collection rate affects learning.
+    min_step_period = 1.0 / FLAGS.actor_max_step_hz if FLAGS.actor_max_step_hz > 0 else 0.0
+
     for step in tqdm.tqdm(range(FLAGS.max_steps), dynamic_ncols=True):
+        step_start_time = time.time()
         timer.tick("total")
 
         with timer.context("sample_actions"):
@@ -171,6 +182,12 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
             client.request("send-stats", stats)
 
         timer.tock("total")
+
+        # Throttle to the requested env-step rate, if enabled.
+        if min_step_period > 0.0:
+            elapsed = time.time() - step_start_time
+            if elapsed < min_step_period:
+                time.sleep(min_step_period - elapsed)
 
         if step % FLAGS.log_period == 0:
             stats = {"timer": timer.get_average_times()}
@@ -345,7 +362,7 @@ def main(_):
     # replicate agent across devices
     # need the jnp.array to avoid a bug where device_put doesn't recognize primitives
     agent: DrQAgent = jax.device_put(
-        jax.tree_map(jnp.array, agent), sharding.replicate()
+        jax.tree_util.tree_map(jnp.array, agent), sharding.replicate()
     )
 
     if FLAGS.learner:

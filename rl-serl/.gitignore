@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Training artifacts
+checkpoints_*/
+classifier_ckpt/*.pkl
+classifier_ckpt/*.csv
+classifier_ckpt/*.png
+classifier_ckpt/checkpoint_*
+!classifier_ckpt/.gitkeep
+
+# Demo data (keep structure, ignore content)
+examples/demo/collected/success/*.pkl
+examples/demo/collected/failure/*.pkl
+examples/demo/collected/raw_images/
+!examples/demo/collected/.gitkeep
+
+# Logs
+*.log
+wandb/
+*.out
+
+# OS
+.DS_Store
+Thumbs.db

@@ -68,17 +68,32 @@ def create_classifier(
     )
 
     # Patch ShapedArray to ignore named_shape for backward compatibility
+    # 需要同时patch __new__ 和 __init__，因为pickle反序列化时会调用两者
+    original_new = jax.core.ShapedArray.__new__
     original_init = jax.core.ShapedArray.__init__
+
+    def patched_new(cls, *args, **kwargs):
+        # 移除named_shape参数（旧版本JAX的遗留参数）
+        kwargs.pop("named_shape", None)
+        return original_new(cls, *args, **kwargs)
+
     def patched_init(self, *args, **kwargs):
         kwargs.pop("named_shape", None)
-        original_init(self, *args, **kwargs)
-    
+        # 如果original_init是object.__init__，它不接受额外参数
+        if original_init is object.__init__:
+            original_init(self)
+        else:
+            original_init(self, *args, **kwargs)
+
+    jax.core.ShapedArray.__new__ = patched_new
     jax.core.ShapedArray.__init__ = patched_init
-    
+
     try:
         with open(pretrained_encoder_path, "rb") as f:
             encoder_params = pkl.load(f)
     finally:
+        # 恢复原始方法
+        jax.core.ShapedArray.__new__ = original_new
         jax.core.ShapedArray.__init__ = original_init
     param_count = sum(x.size for x in jax.tree_util.tree_leaves(encoder_params))
     print(

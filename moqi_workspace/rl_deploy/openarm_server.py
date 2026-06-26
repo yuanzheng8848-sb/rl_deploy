@@ -1,3 +1,9 @@
+import os
+
+# This process only serves hardware/camera/IK requests and should never reserve
+# training GPU memory. Force all downstream frameworks (e.g. JAX) onto CPU.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from sympy.printing.glsl import print_glsl
 import sys
@@ -102,7 +108,7 @@ class OpenArmServer:
             "last_stepped_gripper": None,
             "last_update_ts": 0.0,
             "solve_fail_count": 0,
-            "command_count": 0,
+            "target_update_count": 0,
         }
         self.last_servo_log_ts = 0.0
         self.servo_thread = threading.Thread(target=self._servo_loop, daemon=True)
@@ -227,7 +233,7 @@ class OpenArmServer:
         """Initialize Realsense Cameras"""
         # Camera Configs
         self.cam_configs = {
-            "head": {"type": "opencv", "device_id": "/dev/video10", "width": 1280, "height": 960, "fps": 30, "exposure": 150},
+            "head": {"type": "opencv", "device_id": "/dev/v4l/by-id/usb-Global_Shutter_Camera_Global_Shutter_Camera_01.00.00-video-index0", "width": 1280, "height": 960, "fps": 30, "exposure": 150},
             "left": {"type": "realsense", "serial": "150622074105", "width": 640, "height": 480, "fps": 30},
             "right": {"type": "realsense", "serial": "236422072385", "width": 640, "height": 480, "fps": 30}
         }
@@ -336,9 +342,10 @@ class OpenArmServer:
     def _step_gripper_towards_target(self, current_gripper, target_gripper, active_arms):
         next_gripper = np.array(current_gripper, copy=True)
         for i in range(2):
-            # Right-arm-only teleop: send the right gripper command directly so it can
-            # overcome static friction and match the VR path more closely.
-            if tuple(active_arms) == (1,) and i == 1:
+            # Teleop gripper commands should land directly on the active arm(s) so the
+            # hardware can overcome static friction. The old special-case only covered
+            # right-arm single-arm teleop, which made bimanual teleop appear unresponsive.
+            if i in active_arms:
                 next_gripper[i] = target_gripper[i]
                 continue
             delta = target_gripper[i] - current_gripper[i]
@@ -417,7 +424,7 @@ class OpenArmServer:
         target_gripper=None,
         stepped_gripper=None,
         solve_fail_delta=0,
-        command_delta=0,
+        target_update_delta=0,
     ):
         with self.servo_lock:
             if status is not None:
@@ -441,7 +448,7 @@ class OpenArmServer:
             if stepped_gripper is not None:
                 self.servo_debug["last_stepped_gripper"] = np.array(stepped_gripper, copy=True)
             self.servo_debug["solve_fail_count"] += int(solve_fail_delta)
-            self.servo_debug["command_count"] += int(command_delta)
+            self.servo_debug["target_update_count"] += int(target_update_delta)
             self.servo_debug["last_update_ts"] = time.time()
 
     def _maybe_log_servo_debug(self):
@@ -461,7 +468,7 @@ class OpenArmServer:
         print(
             "[ServoDebug] "
             f"status={dbg['status']} backend={dbg['last_backend']} active_arms={dbg['last_active_arms']} "
-            f"fails={dbg['solve_fail_count']} cmds={dbg['command_count']} "
+            f"fails={dbg['solve_fail_count']} updates={dbg['target_update_count']} "
             f"target_xyz={tgt_xyz} current_xyz={cur_xyz} "
             f"gripper_cur={None if current_gripper is None else np.round(np.array(current_gripper), 4).tolist()} "
             f"gripper_tgt={None if target_gripper is None else np.round(np.array(target_gripper), 4).tolist()} "
@@ -561,7 +568,6 @@ class OpenArmServer:
                 current_gripper=g_curr,
                 target_gripper=target_gripper,
                 stepped_gripper=stepped_gripper,
-                command_delta=1,
             )
             self._maybe_log_servo_debug()
 
@@ -621,17 +627,32 @@ class OpenArmServer:
             self.servo_last_update_ts = time.time()
             self.servo_active_arms = active_arms
             self.servo_backend = str(backend).lower()
+        self._update_servo_debug(
+            status="servo_started",
+            backend=str(backend).lower(),
+            active_arms=active_arms,
+            target_pose=target_pose,
+            target_gripper=target_gripper,
+            target_update_delta=1,
+        )
         return True
 
     def update_servo_target(self, target_pose_flat, gripper_pos=None):
         target_pose = np.array(target_pose_flat, dtype=np.float64).reshape(2, 7)
+        target_gripper = None if gripper_pos is None else np.array(gripper_pos, dtype=np.float64)
         with self.servo_lock:
             if not self.servo_enabled:
                 return False
             self.servo_target_pose = target_pose
-            if gripper_pos is not None:
-                self.servo_target_gripper = np.array(gripper_pos, dtype=np.float64)
+            if target_gripper is not None:
+                self.servo_target_gripper = target_gripper
             self.servo_last_update_ts = time.time()
+        self._update_servo_debug(
+            status="target_updated",
+            target_pose=target_pose,
+            target_gripper=target_gripper,
+            target_update_delta=1,
+        )
         return True
 
     def stop_servo(self):

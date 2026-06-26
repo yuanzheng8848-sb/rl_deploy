@@ -8,4 +8,3 @@ python async_sac_state_sim.py "$@" \
     --training_starts 1000 \
     --critic_actor_ratio 8 \
     --batch_size 256 \
-    --debug # wandb is disabled when debug

@@ -228,7 +228,9 @@ def learner(rng, agent: SACAgent, replay_buffer, replay_iterator):
             batch = next(replay_iterator)
 
         with timer.context("train"):
-            agent, update_info = agent.update_high_utd(batch, utd_ratio=FLAGS.utd_ratio)
+            agent, update_info = agent.update_high_utd(
+                batch, utd_ratio=FLAGS.critic_actor_ratio
+            )
             agent = jax.block_until_ready(agent)
 
             # publish the updated network
@@ -279,7 +281,7 @@ def main(_):
     # replicate agent across devices
     # need the jnp.array to avoid a bug where device_put doesn't recognize primitives
     agent: SACAgent = jax.device_put(
-        jax.tree_map(jnp.array, agent), sharding.replicate()
+        jax.tree_util.tree_map(jnp.array, agent), sharding.replicate()
     )
 
     if FLAGS.learner:
