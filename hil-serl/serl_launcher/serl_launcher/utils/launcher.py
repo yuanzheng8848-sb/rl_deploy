@@ -151,11 +151,15 @@ def make_sac_pixel_agent_hybrid_dual_arm(
     reward_bias=0.0,
     target_entropy=None,
     discount=0.97,
+    bc_actor_loss_type="mse",
+    bc_huber_delta=0.10,
     bc_active_xyz_threshold=0.05,
-    bc_active_xyz_weight=3.0,
+    bc_active_xyz_weight=4.0,
     bc_xyz_norm_loss_weight=0.50,
     bc_xyz_relative_norm_loss_weight=0.15,
     bc_xyz_cosine_loss_weight=0.02,
+    bc_inactive_xyz_loss_weight=0.10,
+    bc_rot_mse_weight=0.10,
 ):
     agent = SACAgentHybridDualArm.create_pixels(
         jax.random.PRNGKey(seed),
@@ -192,11 +196,15 @@ def make_sac_pixel_agent_hybrid_dual_arm(
         critic_subsample_size=None,
         reward_bias=reward_bias,
         target_entropy=target_entropy,
+        bc_actor_loss_type=bc_actor_loss_type,
+        bc_huber_delta=bc_huber_delta,
         bc_active_xyz_threshold=bc_active_xyz_threshold,
         bc_active_xyz_weight=bc_active_xyz_weight,
         bc_xyz_norm_loss_weight=bc_xyz_norm_loss_weight,
         bc_xyz_relative_norm_loss_weight=bc_xyz_relative_norm_loss_weight,
         bc_xyz_cosine_loss_weight=bc_xyz_cosine_loss_weight,
+        bc_inactive_xyz_loss_weight=bc_inactive_xyz_loss_weight,
+        bc_rot_mse_weight=bc_rot_mse_weight,
         augmentation_function=make_batch_augmentation_func(image_keys),
     )
     return agent

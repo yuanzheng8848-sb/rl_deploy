@@ -31,6 +31,17 @@ from experiments.artifacts import (
 from experiments.mappings import CONFIG_MAPPING
 
 
+def find_wrapper(env, class_name: str):
+    cur = env
+    for _ in range(64):
+        if cur.__class__.__name__ == class_name:
+            return cur
+        if not hasattr(cur, "env"):
+            break
+        cur = cur.env
+    return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Record bimanual 3DX demos in the exact training transition format."
@@ -60,6 +71,24 @@ def parse_args():
         type=int,
         default=2,
         help="Discard trajectories with fewer than this many transitions.",
+    )
+    parser.add_argument(
+        "--teleop-control-hz",
+        type=float,
+        default=20.0,
+        help=(
+            "Recorder-side DualSpacemouseIntervention loop rate. Lower values improve "
+            "action/next_observation consistency by giving the servo time to move."
+        ),
+    )
+    parser.add_argument(
+        "--transition-sample-delay",
+        type=float,
+        default=0.05,
+        help=(
+            "Seconds to wait after sending a servo target before sampling next_observation. "
+            "Set 0 to keep the old immediate-sampling behavior."
+        ),
     )
     return parser.parse_args()
 
@@ -189,6 +218,17 @@ def main():
 
     config = CONFIG_MAPPING[args.exp_name]()
     env = config.get_environment(fake_env=False, classifier=False)
+    teleop_wrapper = find_wrapper(env, "DualSpacemouseIntervention")
+    if teleop_wrapper is not None:
+        teleop_wrapper.control_hz = float(args.teleop_control_hz)
+        teleop_wrapper.transition_sample_delay = float(args.transition_sample_delay)
+        print(
+            "[Recorder] teleop timing: "
+            f"control_hz={teleop_wrapper.control_hz:.2f}, "
+            f"transition_sample_delay={teleop_wrapper.transition_sample_delay:.3f}s"
+        )
+    else:
+        print("[Recorder] warning: DualSpacemouseIntervention wrapper not found.")
     keyboard_state = make_keyboard_state()
     listener = start_keyboard_listener(keyboard_state)
 

@@ -66,7 +66,10 @@ def _configure_cuda_paths():
             current_ld = os.environ.get("LD_LIBRARY_PATH", "")
             os.environ["LD_LIBRARY_PATH"] = f"{path}:{current_ld}"
 
-    os.environ["XLA_FLAGS"] = f"--xla_gpu_cuda_data_dir={nvidia_base}"
+    cuda_data_flag = f"--xla_gpu_cuda_data_dir={nvidia_base}"
+    current_flags = os.environ.get("XLA_FLAGS", "")
+    if "--xla_gpu_cuda_data_dir=" not in current_flags:
+        os.environ["XLA_FLAGS"] = f"{current_flags} {cuda_data_flag}".strip()
 
     try:
         nvjitlink_path = os.path.join(nvidia_base, "nvjitlink/lib/libnvJitLink.so.12")

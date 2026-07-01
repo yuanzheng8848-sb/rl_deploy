@@ -33,12 +33,35 @@ examples/experiments/<exp_name>/
 
 ## 完整工作流
 
+### 0. 启动 OpenArm Hardware Server
+
+录制 demo、真机评估 BC、RLPD actor 都需要先启动 OpenArm hardware server。推荐从 `rl_robot_infra` 目录用模块方式启动，确保 `openarm_env` 能被 Python 正确导入：
+
+```bash
+conda activate zy
+cd /home/sj/Desktop/zy/rl-serl/rl_robot_infra
+python -m robot_servers.openarm_server
+```
+
+启动成功后应看到类似日志：
+
+```text
+Starting OpenArm Server on port 5000...
+```
+
+**注意：**
+- Server 默认监听 `http://127.0.0.1:5000/`，与 `DefaultOpenArmConfig.SERVER_URL` 一致
+- 不要从 `examples/` 目录直接运行 `python /home/sj/Desktop/zy/rl-serl/rl_robot_infra/robot_servers/openarm_server.py`，否则可能出现 `ModuleNotFoundError: No module named 'openarm_env'`
+- 如果要使用真硬件，请确认 `robot_servers/openarm_server.py` 中 `USE_MOCK = False`；mock 调试则保持 `USE_MOCK = True`
+
 ### 1. 录制 Demo
 
 ```bash
 cd rl-serl/examples
 python record_demos.py --exp_name openarm_pickplace
 ```
+
+录制前请在另一个终端保持 OpenArm hardware server 运行。
 
 **操作说明：**
 - `ENTER` 键：保存为 success demo
@@ -187,7 +210,7 @@ python eval_bc_offline.py --exp_name openarm_pickplace --noplot_3d_trajectories
 
 ### 5. 真机评估 BC Checkpoint
 
-在真机上直接运行 BC policy，不启动 RLPD。
+在真机上直接运行 BC policy，不启动 RLPD。运行前需要先启动 OpenArm hardware server。
 
 ```bash
 python eval_bc_real.py \
@@ -220,6 +243,7 @@ python eval_bc_real.py \
 
 **注意事项：**
 - 必须先训练 classifier，否则无法自动统计 success
+- 必须保持 OpenArm hardware server 运行在 `http://127.0.0.1:5000/`
 - 不会写入 `checkpoints_rlpd/buffer` 或 `checkpoints_rlpd/demo_buffer`
 - 不启动 TrainerServer/TrainerClient
 
@@ -236,6 +260,8 @@ python train_rlpd.py \
     --exp_name openarm_pickplace \
     --actor
 ```
+
+Actor 会连接 OpenArm hardware server 与真实环境交互；启动 actor 前请确认 server 已运行。
 
 **BC Warmup 自动加载逻辑：**
 
@@ -295,6 +321,15 @@ python train_rlpd.py --exp_name openarm_pickplace --learner --mock --max_steps 2
 ## 完整真机验证流程
 
 ```bash
+# Terminal 0: OpenArm hardware server
+conda activate zy
+cd /home/sj/Desktop/zy/rl-serl/rl_robot_infra
+python -m robot_servers.openarm_server
+
+# Terminal 1: BC/RLPD workflow
+conda activate zy
+cd /home/sj/Desktop/zy/rl-serl/examples
+
 # 1. 录 10-20 条 success demo + 5-10 条 failure demo
 python record_demos.py --exp_name openarm_pickplace
 
@@ -378,9 +413,6 @@ A: 推荐 10-20 条 success demo 作为起点。Demo 过少会导致 BC overfitt
 A:
 - **离线评估**：逐帧预测动作并与 demo 对比，诊断 action imitation 质量，不连接真机。包含 3D 动作轨迹可视化，直观对比预测与示教动作的空间差异。
 - **真机评估**：在真实环境中 rollout BC policy，统计 success rate，验证实际表现。
-- **离线评估**：逐帧预测动作并与 demo 对比，诊断 action imitation 质量，不连接真机。包含 3D 动作轨迹可视化，直观对比预测与示教动作的空间差异。
-- **真机评估**：在真实环境中 rollout BC policy，统计 success rate，验证实际表现。
-
 
 ### Q: BC warmup 会降低 RLPD 探索吗？
 
@@ -403,6 +435,7 @@ A: `eval_bc_real.py` 默认需要 classifier 来自动判断 success。如果没
 1. **Demo 质量**：BC 完全依赖 demo 质量，噪声 demo 会直接污染 BC policy
 2. **Gripper 训练**：必须显式监督 `grasp_critic`，否则夹爪未训练
 3. **离线评估局限**：离线评估只能诊断 action imitation 质量，不能替代真机 success rate
+4. **Hardware server**：录制 demo、真机评估和 RLPD actor 需要先启动 OpenArm hardware server
 5. **Classifier 依赖**：真机评估必须有 classifier，否则无法自动统计 success
 6. **路径隔离**：BC checkpoint 和 RLPD checkpoint 严格分开，避免混淆
 7. **图像裁剪一致性**：demo pkl、BC 训练、RLPD 训练必须使用相同的 `image_primary` 裁剪（128x128）

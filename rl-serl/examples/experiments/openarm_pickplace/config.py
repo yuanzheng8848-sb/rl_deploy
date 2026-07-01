@@ -27,7 +27,6 @@ from franka_env.envs.wrappers import MultiCameraBinaryRewardClassifierWrapper
 from rl_launcher.wrappers import SERLObsWrapper, ChunkingWrapper
 
 from experiments.config import DefaultTrainingConfig
-from experiments.artifacts import task_classifier_ckpt_dir
 
 
 # Image streams fed to the policy encoder (three cameras).
@@ -45,8 +44,10 @@ CLASSIFIER_THRESHOLD = 0.85
 CLASSIFIER_SUCCESS_TAIL_FRAMES = 30
 CLASSIFIER_FAILURE_HEAD_FRAMES = 30
 
-# Default classifier checkpoint location under this task folder.
-DEFAULT_CLASSIFIER_CKPT = str(task_classifier_ckpt_dir("openarm_pickplace"))
+# Default classifier checkpoint location used by train/eval render and reward reference.
+DEFAULT_CLASSIFIER_CKPT = (
+    "/home/sj/Desktop/zy/rl-serl/examples/experiments/openarm_pickplace/classifier_ckpt"
+)
 
 
 class EnvConfig(DefaultOpenArmConfig):

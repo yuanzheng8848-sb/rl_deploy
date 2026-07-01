@@ -578,25 +578,6 @@ def _one_step_action_xyz(actions, tcp_path, action_scale: float = 0.01):
     return eval_path
 
 
-def _integrated_action_path(actions, tcp_path, action_scale: float = 0.01):
-    """Integrate action xyz into one continuous TCP-like path from the TCP start."""
-    actions = np.asarray(actions, dtype=np.float32)
-    tcp_path = np.asarray(tcp_path, dtype=np.float32)
-    count = min(actions.shape[0], tcp_path.shape[0])
-    if count < 1:
-        return np.empty((0, 3), dtype=np.float32)
-
-    out = np.full((count, 3), np.nan, dtype=np.float32)
-    if not np.all(np.isfinite(tcp_path[0])):
-        return out
-    out[0] = tcp_path[0]
-    for idx in range(count - 1):
-        if not np.all(np.isfinite(actions[idx])) or not np.all(np.isfinite(out[idx])):
-            break
-        out[idx + 1] = out[idx] + actions[idx] * action_scale
-    return out
-
-
 def _step_error(actions, tcp_path, action_scale: float = 0.01):
     """Return one-step TCP endpoint MSE and last-step error."""
     actions = np.asarray(actions, dtype=np.float32)
@@ -849,190 +830,34 @@ def plot_step_action_trajectories(output_dir, traj_xyz):
     )
 
 
-def _plot_action_xyz_trajectory(ax, pred_actions, demo_actions, tcp_path, title,
-                                action_scale: float = 0.01):
-    """Plot eval and demo actions integrated into TCP-like trajectories."""
-    if pred_actions.shape[0] < 2 or demo_actions.shape[0] < 2 or tcp_path.shape[0] < 2:
-        ax.set_title(f"{title}\n(insufficient data)", fontsize=10)
-        ax.axis('off')
-        return
-
-    count = min(pred_actions.shape[0], demo_actions.shape[0], tcp_path.shape[0])
-    pred_actions = pred_actions[:count]
-    demo_actions = demo_actions[:count]
-    tcp_path = tcp_path[:count]
-
-    demo_path = _integrated_action_path(demo_actions, tcp_path, action_scale)
-    pred_path = _integrated_action_path(pred_actions, tcp_path, action_scale)
-    mse = _xyz_mse(pred_actions, demo_actions)
-    mse_text = f"{mse:.4f}" if mse is not None else "nan"
-    path_mse = _xyz_mse(pred_path, demo_path)
-    path_mse_text = f"{path_mse:.4f}" if path_mse is not None else "nan"
-
-    ax.plot(demo_path[:, 0], demo_path[:, 1], demo_path[:, 2],
-            color="black", linewidth=2.3, alpha=0.85, label="Demo action-integrated path")
-    demo_finite = np.flatnonzero(np.all(np.isfinite(demo_path), axis=1))
-    if demo_finite.size:
-        ax.scatter(*demo_path[demo_finite[0]], color="black", marker="o", s=70, zorder=10)
-        ax.scatter(*demo_path[demo_finite[-1]], color="black", marker="*", s=110, zorder=10)
-
-    ax.plot(pred_path[:, 0], pred_path[:, 1], pred_path[:, 2],
-            color="red", linewidth=2.0, alpha=0.8, label="Eval action-integrated path")
-    pred_finite = np.flatnonzero(np.all(np.isfinite(pred_path), axis=1))
-    if pred_finite.size:
-        ax.scatter(*pred_path[pred_finite[0]], color="red", marker="o", s=55, zorder=10)
-        ax.scatter(*pred_path[pred_finite[-1]], color="red", marker="*", s=90, zorder=10)
-
-    ax.set_xlabel("x (m)", fontsize=9)
-    ax.set_ylabel("y (m)", fontsize=9)
-    ax.set_zlabel("z (m)", fontsize=9)
-    ax.set_title(
-        f"{title}\naction MSE={mse_text}, path MSE={path_mse_text}",
-        fontsize=10,
-        fontweight="bold",
-    )
-    ax.legend(fontsize=8, loc="upper left")
-    ax.grid(True, alpha=0.3)
-
-
-def plot_action_xyz_trajectories(output_dir, traj_xyz):
-    """Render action-integrated eval vs demo TCP-like trajectories as standalone PNGs."""
-    if not traj_xyz:
-        return
-    png_dir = output_dir / "trajectory_action"
-    png_dir.mkdir(exist_ok=True)
-
-    ordered = sorted(
-        traj_xyz,
-        key=lambda s: s.get("continuous_mse", 0.0),
-        reverse=True,
-    )
-    count = FLAGS.traj_count
-    if count and count > 0:
-        ordered = ordered[:count]
-
-    for xyz_seq in ordered:
-        name = Path(xyz_seq["trajectory"]).stem
-        mse = xyz_seq.get("continuous_mse", float("nan"))
-
-        pred_l = _stack_xyz(xyz_seq["pred_left"])
-        pred_r = _stack_xyz(xyz_seq["pred_right"])
-        demo_l = _stack_xyz(xyz_seq["demo_left"])
-        demo_r = _stack_xyz(xyz_seq["demo_right"])
-        path_l = _stack_xyz(xyz_seq["path_left"])
-        path_r = _stack_xyz(xyz_seq["path_right"])
-
-        fig = plt.figure(figsize=(14, 6))
-        fig.suptitle(
-            f"Eval vs Demo Action-Integrated Trajectory — {name}  (MSE={mse:.4f})",
-            fontsize=14,
-            fontweight="bold",
-        )
-
-        ax1 = fig.add_subplot(1, 2, 1, projection="3d")
-        _plot_action_xyz_trajectory(ax1, pred_l, demo_l, path_l, "Left Arm")
-
-        ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-        _plot_action_xyz_trajectory(ax2, pred_r, demo_r, path_r, "Right Arm")
-
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
-        fig.savefig(png_dir / f"{name}_action_xyz.png", dpi=120)
-        plt.close(fig)
-
-    print_green(
-        f"[Visualization] Action xyz trajectory plots: {len(ordered)} figures -> {png_dir}"
-    )
-
-
-def _action_metric_arrays(pred_actions, demo_actions, active_threshold=None):
-    """Return per-frame action-space diagnostics for xyz actions."""
-    pred_actions = np.asarray(pred_actions, dtype=np.float32)
-    demo_actions = np.asarray(demo_actions, dtype=np.float32)
+def _plot_action_diagnostics_row(axes, pred_actions, demo_actions, title):
     count = min(pred_actions.shape[0], demo_actions.shape[0])
-    empty = {
-        "demo_action_norm": np.empty((0,), dtype=np.float32),
-        "pred_action_norm": np.empty((0,), dtype=np.float32),
-        "action_error_norm": np.empty((0,), dtype=np.float32),
-        "relative_action_error": np.empty((0,), dtype=np.float32),
-        "direction_cosine": np.empty((0,), dtype=np.float32),
-        "is_active": np.empty((0,), dtype=bool),
-    }
-    if count < 1:
-        return empty
+    frames = np.arange(count)
+    component_names = ("X", "Y", "Z")
 
-    threshold = FLAGS.active_action_threshold if active_threshold is None else active_threshold
     pred = pred_actions[:count]
     demo = demo_actions[:count]
-    error = pred - demo
-    finite = (
-        np.all(np.isfinite(pred), axis=1)
-        & np.all(np.isfinite(demo), axis=1)
-        & np.all(np.isfinite(error), axis=1)
-    )
 
-    demo_norm = np.full((count,), np.nan, dtype=np.float32)
-    pred_norm = np.full((count,), np.nan, dtype=np.float32)
-    error_norm = np.full((count,), np.nan, dtype=np.float32)
-    relative_error = np.full((count,), np.nan, dtype=np.float32)
-    direction_cosine = np.full((count,), np.nan, dtype=np.float32)
-
-    demo_norm[finite] = np.linalg.norm(demo[finite], axis=1)
-    pred_norm[finite] = np.linalg.norm(pred[finite], axis=1)
-    error_norm[finite] = np.linalg.norm(error[finite], axis=1)
-    relative_error[finite] = error_norm[finite] / np.maximum(demo_norm[finite], 1e-6)
-
-    denom = demo_norm * pred_norm
-    valid_direction = finite & (denom > 1e-12)
-    direction_cosine[valid_direction] = (
-        np.sum(pred[valid_direction] * demo[valid_direction], axis=1)
-        / denom[valid_direction]
-    )
-
-    return {
-        "demo_action_norm": demo_norm,
-        "pred_action_norm": pred_norm,
-        "action_error_norm": error_norm,
-        "relative_action_error": relative_error,
-        "direction_cosine": direction_cosine,
-        "is_active": finite & (demo_norm > threshold),
-    }
-
-
-def _plot_action_diagnostics_row(axes, metrics, title):
-    frames = np.arange(metrics["demo_action_norm"].shape[0])
-    active = metrics["is_active"]
-
-    axes[0].plot(frames, metrics["demo_action_norm"], color="black",
-                 linewidth=1.5, label="Demo action norm")
-    axes[0].plot(frames, metrics["action_error_norm"], color="red",
-                 linewidth=1.2, alpha=0.85, label="Action error norm")
-    axes[0].set_title(f"{title}: action size vs error", fontsize=10, fontweight="bold")
-    axes[0].set_xlabel("Frame")
-    axes[0].set_ylabel("action norm")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].scatter(frames[active], metrics["relative_action_error"][active],
-                    s=8, color="red", alpha=0.7)
-    axes[1].axhline(1.0, color="black", linestyle="--", linewidth=1.0)
-    axes[1].set_title(f"{title}: relative error (active)", fontsize=10, fontweight="bold")
-    axes[1].set_xlabel("Frame")
-    axes[1].set_ylabel("error / demo action")
-    axes[1].grid(True, alpha=0.3)
-
-    axes[2].scatter(frames[active], metrics["direction_cosine"][active],
-                    s=8, color="green", alpha=0.7)
-    axes[2].axhline(1.0, color="black", linestyle="--", linewidth=1.0)
-    axes[2].axhline(0.0, color="gray", linestyle=":", linewidth=1.0)
-    axes[2].set_title(f"{title}: direction cosine (active)", fontsize=10, fontweight="bold")
-    axes[2].set_xlabel("Frame")
-    axes[2].set_ylabel("cosine")
-    axes[2].set_ylim([-1.05, 1.05])
-    axes[2].grid(True, alpha=0.3)
+    for dim, ax in enumerate(axes):
+        ax.plot(frames, demo[:, dim], color="black", linewidth=1.5,
+                alpha=0.9, label="Demo action")
+        ax.plot(frames, pred[:, dim], color="red", linewidth=1.2,
+                alpha=0.85, label="Eval action")
+        ax.axhline(0.0, color="gray", linestyle=":", linewidth=0.9)
+        ax.set_title(
+            f"{title}: {component_names[dim]} action",
+            fontsize=10,
+            fontweight="bold",
+        )
+        ax.set_xlabel("Frame")
+        ax.set_ylabel("action value")
+        if dim == 0:
+            ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
 
 
 def plot_action_diagnostics(output_dir, traj_xyz):
-    """Render per-frame action-space absolute/relative diagnostics as PNGs."""
+    """Render per-frame predicted vs demo xyz actions as PNGs."""
     if not traj_xyz:
         return
     png_dir = output_dir / "trajectory_action_diagnostics"
@@ -1053,18 +878,15 @@ def plot_action_diagnostics(output_dir, traj_xyz):
         pred_r = _stack_xyz(xyz_seq["pred_right"])
         demo_l = _stack_xyz(xyz_seq["demo_left"])
         demo_r = _stack_xyz(xyz_seq["demo_right"])
-        left_metrics = _action_metric_arrays(pred_l, demo_l)
-        right_metrics = _action_metric_arrays(pred_r, demo_r)
 
         fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=False)
         fig.suptitle(
-            f"Action XYZ Diagnostics — {name}  "
-            f"(active > {FLAGS.active_action_threshold:.2f})",
+            f"Per-frame Action XYZ — {name}",
             fontsize=14,
             fontweight="bold",
         )
-        _plot_action_diagnostics_row(axes[0], left_metrics, "Left Arm")
-        _plot_action_diagnostics_row(axes[1], right_metrics, "Right Arm")
+        _plot_action_diagnostics_row(axes[0], pred_l, demo_l, "Left Arm")
+        _plot_action_diagnostics_row(axes[1], pred_r, demo_r, "Right Arm")
         fig.tight_layout(rect=(0, 0, 1, 0.95))
         fig.savefig(png_dir / f"{name}_action_diagnostics.png", dpi=120)
         plt.close(fig)
@@ -1172,7 +994,10 @@ def evaluate_split(agent, split_name, dir_path, rng):
             "path_left": [], "path_right": [],   # tcp_pose xyz (ground-truth EE path)
         }
         for frame_idx, transition in enumerate(traj):
-            prepared = prepare_transition(transition, skip_zero_action=False)
+            prepared = prepare_transition(
+                transition,
+                skip_zero_action=False,
+            )
             if prepared is None:
                 continue
             rng, key = jax.random.split(rng)
@@ -1263,10 +1088,12 @@ def main(_):
     if FLAGS.exp_name not in CONFIG_MAPPING:
         raise ValueError(f"Experiment {FLAGS.exp_name!r} not found in CONFIG_MAPPING.")
     config = CONFIG_MAPPING[FLAGS.exp_name]()
+    default_checkpoint_path = os.fspath(task_bc_checkpoint_dir(FLAGS.exp_name))
     checkpoint_path = os.path.abspath(
-        FLAGS.bc_checkpoint_path or task_bc_checkpoint_dir(FLAGS.exp_name)
+        FLAGS.bc_checkpoint_path or default_checkpoint_path
     )
-    output_dir = Path(FLAGS.output_dir or (task_bc_eval_dir(FLAGS.exp_name) / "offline"))
+    default_output_dir = task_bc_eval_dir(FLAGS.exp_name) / "offline"
+    output_dir = Path(FLAGS.output_dir or default_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     env = config.get_environment(fake_env=True, classifier=False)
@@ -1371,10 +1198,9 @@ def main(_):
             traceback.print_exc()
             print("CSV and JSON outputs are still available.")
 
-    # Generate one-step eval vs real end-effector trajectory comparison (standalone PNGs)
+    # Generate action and one-step end-effector comparison plots (standalone PNGs)
     if FLAGS.plot_trajectories and all_traj_xyz:
         try:
-            plot_action_xyz_trajectories(output_dir, all_traj_xyz)
             plot_action_diagnostics(output_dir, all_traj_xyz)
             plot_step_action_trajectories(output_dir, all_traj_xyz)
         except Exception as e:

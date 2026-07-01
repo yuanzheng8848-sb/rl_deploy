@@ -77,7 +77,12 @@ def prepare_transition(transition, skip_zero_action=False):
     return prepared
 
 
-def load_demo_dir_into_buffer(dir_path, data_store, skip_zero_action=False, max_trajs=0):
+def load_demo_dir_into_buffer(
+    dir_path,
+    data_store,
+    skip_zero_action=False,
+    max_trajs=0,
+):
     loaded_files = 0
     loaded_transitions = 0
     skipped = 0
@@ -88,7 +93,10 @@ def load_demo_dir_into_buffer(dir_path, data_store, skip_zero_action=False, max_
             if idx == 0:
                 skipped += 1
                 continue
-            prepared = prepare_transition(transition, skip_zero_action=skip_zero_action)
+            prepared = prepare_transition(
+                transition,
+                skip_zero_action=skip_zero_action,
+            )
             if prepared is None:
                 skipped += 1
                 continue

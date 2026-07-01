@@ -356,6 +356,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         servo_trans_step=0.004,
         servo_rot_step=0.012,
         servo_gripper_step=0.05,
+        transition_sample_delay=0.0,
         print_raw=False,
     ):
         super().__init__(env)
@@ -374,6 +375,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         self.servo_trans_step = float(servo_trans_step)
         self.servo_rot_step = float(servo_rot_step)
         self.servo_gripper_step = float(servo_gripper_step)
+        self.transition_sample_delay = float(transition_sample_delay)
         self.print_raw = bool(print_raw)
 
         self.axis_codes = {}
@@ -654,6 +656,8 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
 
     def _sample_env_like_step(self, action):
         base_env = self.env.unwrapped
+        if self.transition_sample_delay > 0:
+            time.sleep(self.transition_sample_delay)
         raw_next_obs = base_env.refresh_obs()
         next_obs = self._transform_obs_to_policy_space(raw_next_obs)
         # Reward comes from the outer classifier wrapper, not from teleop.
@@ -673,6 +677,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             "intervention_mode": True,
             "intervened": True,
             "control_backend": self.servo_backend,
+            "transition_sample_delay": self.transition_sample_delay,
             "sampled_transition": transition,
         }
         self._prev_obs_for_transition = next_obs

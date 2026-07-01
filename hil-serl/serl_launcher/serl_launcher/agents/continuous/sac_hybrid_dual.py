@@ -302,10 +302,12 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         Regresses the 12-dim continuous action (gripper handled separately by grasp_critic).
         """
         batch_size = batch["rewards"].shape[0]
+        actor_loss_type = self.config.get("bc_actor_loss_type", "mse")
+        huber_delta = self.config.get("bc_huber_delta", 0.10)
         active_xyz_threshold = self.config.get("bc_active_xyz_threshold", 0.05)
-        active_xyz_weight = self.config.get("bc_active_xyz_weight", 3.0)
+        active_xyz_weight = self.config.get("bc_active_xyz_weight", 4.0)
         high_xyz_norm_beta = self.config.get("bc_high_xyz_norm_beta", 0.0)
-        rot_mse_weight = self.config.get("bc_rot_mse_weight", 0.25)
+        rot_mse_weight = self.config.get("bc_rot_mse_weight", 0.10)
         xyz_norm_loss_weight = self.config.get("bc_xyz_norm_loss_weight", 0.50)
         xyz_relative_norm_loss_weight = self.config.get(
             "bc_xyz_relative_norm_loss_weight", 0.15
@@ -313,6 +315,7 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         rot_norm_loss_weight = self.config.get("bc_rot_norm_loss_weight", 0.02)
         xyz_cosine_loss_weight = self.config.get("bc_xyz_cosine_loss_weight", 0.02)
         rot_cosine_loss_weight = self.config.get("bc_rot_cosine_loss_weight", 0.0)
+        inactive_xyz_loss_weight = self.config.get("bc_inactive_xyz_loss_weight", 0.10)
         eps = 1e-6
 
         # Extract continuous 12-dim from demo actions (skip gripper at indices 6 and 13)
@@ -334,77 +337,193 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         # only by the env at execution time, not in the BC target/loss space.
         predicted_actions = action_distributions.mode()
 
-        pred_xyz = jnp.concatenate(
-            [predicted_actions[..., :3], predicted_actions[..., 6:9]], axis=-1
-        )
-        target_xyz = jnp.concatenate(
-            [target_actions[..., :3], target_actions[..., 6:9]], axis=-1
-        )
-        pred_rot = jnp.concatenate(
-            [predicted_actions[..., 3:6], predicted_actions[..., 9:12]], axis=-1
-        )
-        target_rot = jnp.concatenate(
-            [target_actions[..., 3:6], target_actions[..., 9:12]], axis=-1
-        )
+        pred_left_xyz = predicted_actions[..., :3]
+        pred_left_rot = predicted_actions[..., 3:6]
+        pred_right_xyz = predicted_actions[..., 6:9]
+        pred_right_rot = predicted_actions[..., 9:12]
+        target_left_xyz = target_actions[..., :3]
+        target_left_rot = target_actions[..., 3:6]
+        target_right_xyz = target_actions[..., 6:9]
+        target_right_rot = target_actions[..., 9:12]
+        pred_xyz = jnp.concatenate([pred_left_xyz, pred_right_xyz], axis=-1)
+        target_xyz = jnp.concatenate([target_left_xyz, target_right_xyz], axis=-1)
+        pred_rot = jnp.concatenate([pred_left_rot, pred_right_rot], axis=-1)
+        target_rot = jnp.concatenate([target_left_rot, target_right_rot], axis=-1)
 
         target_norm = jnp.linalg.norm(target_actions, axis=-1)
         pred_norm = jnp.linalg.norm(predicted_actions, axis=-1)
+        target_left_xyz_norm = jnp.linalg.norm(target_left_xyz, axis=-1)
+        target_right_xyz_norm = jnp.linalg.norm(target_right_xyz, axis=-1)
+        pred_left_xyz_norm = jnp.linalg.norm(pred_left_xyz, axis=-1)
+        pred_right_xyz_norm = jnp.linalg.norm(pred_right_xyz, axis=-1)
         target_xyz_norm = jnp.linalg.norm(target_xyz, axis=-1)
         pred_xyz_norm = jnp.linalg.norm(pred_xyz, axis=-1)
+        target_left_rot_norm = jnp.linalg.norm(target_left_rot, axis=-1)
+        target_right_rot_norm = jnp.linalg.norm(target_right_rot, axis=-1)
+        pred_left_rot_norm = jnp.linalg.norm(pred_left_rot, axis=-1)
+        pred_right_rot_norm = jnp.linalg.norm(pred_right_rot, axis=-1)
         target_rot_norm = jnp.linalg.norm(target_rot, axis=-1)
         pred_rot_norm = jnp.linalg.norm(pred_rot, axis=-1)
 
-        active_xyz_mask = (target_xyz_norm > active_xyz_threshold).astype(jnp.float32)
-        sample_weights = (
+        left_active_mask = (target_left_xyz_norm > active_xyz_threshold).astype(jnp.float32)
+        right_active_mask = (target_right_xyz_norm > active_xyz_threshold).astype(jnp.float32)
+        left_weights = (
             1.0
-            + active_xyz_weight * active_xyz_mask
-            + high_xyz_norm_beta * target_xyz_norm
+            + active_xyz_weight * left_active_mask
+            + high_xyz_norm_beta * target_left_xyz_norm
         )
-        weight_sum = jnp.sum(sample_weights) + eps
+        right_weights = (
+            1.0
+            + active_xyz_weight * right_active_mask
+            + high_xyz_norm_beta * target_right_xyz_norm
+        )
+        left_weight_sum = jnp.sum(left_weights) + eps
+        right_weight_sum = jnp.sum(right_weights) + eps
 
-        per_sample_xyz_mse = jnp.mean((pred_xyz - target_xyz) ** 2, axis=-1)
-        per_sample_rot_mse = jnp.mean((pred_rot - target_rot) ** 2, axis=-1)
-        xyz_mse_loss = jnp.sum(sample_weights * per_sample_xyz_mse) / weight_sum
-        rot_mse_loss = jnp.sum(sample_weights * per_sample_rot_mse) / weight_sum
-        action_mse_loss = xyz_mse_loss + rot_mse_weight * rot_mse_loss
+        if actor_loss_type == "huber":
+            per_dim_left_xyz_loss = optax.huber_loss(
+                pred_left_xyz - target_left_xyz, delta=huber_delta
+            )
+            per_dim_right_xyz_loss = optax.huber_loss(
+                pred_right_xyz - target_right_xyz, delta=huber_delta
+            )
+            per_dim_left_rot_loss = optax.huber_loss(
+                pred_left_rot - target_left_rot, delta=huber_delta
+            )
+            per_dim_right_rot_loss = optax.huber_loss(
+                pred_right_rot - target_right_rot, delta=huber_delta
+            )
+        else:
+            per_dim_left_xyz_loss = (pred_left_xyz - target_left_xyz) ** 2
+            per_dim_right_xyz_loss = (pred_right_xyz - target_right_xyz) ** 2
+            per_dim_left_rot_loss = (pred_left_rot - target_left_rot) ** 2
+            per_dim_right_rot_loss = (pred_right_rot - target_right_rot) ** 2
 
-        per_sample_xyz_norm_loss = (pred_xyz_norm - target_xyz_norm) ** 2
-        per_sample_rot_norm_loss = (pred_rot_norm - target_rot_norm) ** 2
-        xyz_norm_loss = (
-            jnp.sum(sample_weights * per_sample_xyz_norm_loss) / weight_sum
+        left_xyz_regression_loss = (
+            jnp.sum(left_weights * jnp.mean(per_dim_left_xyz_loss, axis=-1))
+            / left_weight_sum
         )
-        rot_norm_loss = (
-            jnp.sum(sample_weights * per_sample_rot_norm_loss) / weight_sum
+        right_xyz_regression_loss = (
+            jnp.sum(right_weights * jnp.mean(per_dim_right_xyz_loss, axis=-1))
+            / right_weight_sum
         )
-        xyz_relative_norm_loss = jnp.sum(
-            sample_weights
-            * active_xyz_mask
+        xyz_regression_loss = 0.5 * (
+            left_xyz_regression_loss + right_xyz_regression_loss
+        )
+        left_rot_regression_loss = (
+            jnp.sum(left_weights * jnp.mean(per_dim_left_rot_loss, axis=-1))
+            / left_weight_sum
+        )
+        right_rot_regression_loss = (
+            jnp.sum(right_weights * jnp.mean(per_dim_right_rot_loss, axis=-1))
+            / right_weight_sum
+        )
+        rot_regression_loss = 0.5 * (
+            left_rot_regression_loss + right_rot_regression_loss
+        )
+        action_regression_loss = xyz_regression_loss + rot_mse_weight * rot_regression_loss
+        left_xyz_mse_loss = (
+            jnp.sum(left_weights * jnp.mean((pred_left_xyz - target_left_xyz) ** 2, axis=-1))
+            / left_weight_sum
+        )
+        right_xyz_mse_loss = (
+            jnp.sum(right_weights * jnp.mean((pred_right_xyz - target_right_xyz) ** 2, axis=-1))
+            / right_weight_sum
+        )
+        xyz_mse_loss = 0.5 * (left_xyz_mse_loss + right_xyz_mse_loss)
+        left_rot_mse_loss = (
+            jnp.sum(left_weights * jnp.mean((pred_left_rot - target_left_rot) ** 2, axis=-1))
+            / left_weight_sum
+        )
+        right_rot_mse_loss = (
+            jnp.sum(right_weights * jnp.mean((pred_right_rot - target_right_rot) ** 2, axis=-1))
+            / right_weight_sum
+        )
+        rot_mse_loss = 0.5 * (left_rot_mse_loss + right_rot_mse_loss)
+
+        left_xyz_norm_loss = (
+            jnp.sum(left_weights * (pred_left_xyz_norm - target_left_xyz_norm) ** 2)
+            / left_weight_sum
+        )
+        right_xyz_norm_loss = (
+            jnp.sum(right_weights * (pred_right_xyz_norm - target_right_xyz_norm) ** 2)
+            / right_weight_sum
+        )
+        xyz_norm_loss = 0.5 * (left_xyz_norm_loss + right_xyz_norm_loss)
+        left_rot_norm_loss = (
+            jnp.sum(left_weights * (pred_left_rot_norm - target_left_rot_norm) ** 2)
+            / left_weight_sum
+        )
+        right_rot_norm_loss = (
+            jnp.sum(right_weights * (pred_right_rot_norm - target_right_rot_norm) ** 2)
+            / right_weight_sum
+        )
+        rot_norm_loss = 0.5 * (left_rot_norm_loss + right_rot_norm_loss)
+
+        left_xyz_relative_norm_loss = jnp.sum(
+            left_weights
+            * left_active_mask
             * (
-                (pred_xyz_norm - target_xyz_norm)
-                / jnp.maximum(target_xyz_norm, active_xyz_threshold)
+                (pred_left_xyz_norm - target_left_xyz_norm)
+                / jnp.maximum(target_left_xyz_norm, active_xyz_threshold)
             ) ** 2
-        ) / (jnp.sum(sample_weights * active_xyz_mask) + eps)
-        active_xyz_count = jnp.sum(active_xyz_mask) + eps
-        xyz_norm_ratio = jnp.sum(
-            active_xyz_mask * pred_xyz_norm / jnp.maximum(target_xyz_norm, eps)
+        ) / (jnp.sum(left_weights * left_active_mask) + eps)
+        right_xyz_relative_norm_loss = jnp.sum(
+            right_weights
+            * right_active_mask
+            * (
+                (pred_right_xyz_norm - target_right_xyz_norm)
+                / jnp.maximum(target_right_xyz_norm, active_xyz_threshold)
+            ) ** 2
+        ) / (jnp.sum(right_weights * right_active_mask) + eps)
+        xyz_relative_norm_loss = 0.5 * (
+            left_xyz_relative_norm_loss + right_xyz_relative_norm_loss
+        )
+        active_xyz_count = jnp.sum(left_active_mask) + jnp.sum(right_active_mask) + eps
+        xyz_norm_ratio = (
+            jnp.sum(left_active_mask * pred_left_xyz_norm / jnp.maximum(target_left_xyz_norm, eps))
+            + jnp.sum(right_active_mask * pred_right_xyz_norm / jnp.maximum(target_right_xyz_norm, eps))
         ) / active_xyz_count
 
-        xyz_cosine = jnp.sum(pred_xyz * target_xyz, axis=-1) / (
-            pred_xyz_norm * target_xyz_norm + eps
+        left_inactive_mask = 1.0 - left_active_mask
+        right_inactive_mask = 1.0 - right_active_mask
+        left_inactive_xyz_loss = jnp.sum(
+            left_inactive_mask * (pred_left_xyz_norm ** 2)
+        ) / (jnp.sum(left_inactive_mask) + eps)
+        right_inactive_xyz_loss = jnp.sum(
+            right_inactive_mask * (pred_right_xyz_norm ** 2)
+        ) / (jnp.sum(right_inactive_mask) + eps)
+        inactive_xyz_loss = 0.5 * (
+            left_inactive_xyz_loss + right_inactive_xyz_loss
         )
-        xyz_cosine = jnp.clip(xyz_cosine, -1.0, 1.0)
-        xyz_cosine_mask = (target_xyz_norm > 1e-3).astype(jnp.float32)
-        xyz_cosine_weight_sum = jnp.sum(sample_weights * xyz_cosine_mask) + eps
-        xyz_cosine_loss = (
-            jnp.sum(sample_weights * xyz_cosine_mask * (1.0 - xyz_cosine))
-            / xyz_cosine_weight_sum
+
+        left_xyz_cosine = jnp.sum(pred_left_xyz * target_left_xyz, axis=-1) / (
+            pred_left_xyz_norm * target_left_xyz_norm + eps
         )
+        right_xyz_cosine = jnp.sum(pred_right_xyz * target_right_xyz, axis=-1) / (
+            pred_right_xyz_norm * target_right_xyz_norm + eps
+        )
+        left_xyz_cosine = jnp.clip(left_xyz_cosine, -1.0, 1.0)
+        right_xyz_cosine = jnp.clip(right_xyz_cosine, -1.0, 1.0)
+        left_xyz_cosine_mask = (target_left_xyz_norm > 1e-3).astype(jnp.float32)
+        right_xyz_cosine_mask = (target_right_xyz_norm > 1e-3).astype(jnp.float32)
+        left_xyz_cosine_loss = (
+            jnp.sum(left_weights * left_xyz_cosine_mask * (1.0 - left_xyz_cosine))
+            / (jnp.sum(left_weights * left_xyz_cosine_mask) + eps)
+        )
+        right_xyz_cosine_loss = (
+            jnp.sum(right_weights * right_xyz_cosine_mask * (1.0 - right_xyz_cosine))
+            / (jnp.sum(right_weights * right_xyz_cosine_mask) + eps)
+        )
+        xyz_cosine_loss = 0.5 * (left_xyz_cosine_loss + right_xyz_cosine_loss)
 
         rot_cosine = jnp.sum(pred_rot * target_rot, axis=-1) / (
             pred_rot_norm * target_rot_norm + eps
         )
         rot_cosine = jnp.clip(rot_cosine, -1.0, 1.0)
         rot_cosine_mask = (target_rot_norm > 1e-3).astype(jnp.float32)
+        # Use average of left and right weights for combined rotation cosine loss
+        sample_weights = 0.5 * (left_weights + right_weights)
         rot_cosine_weight_sum = jnp.sum(sample_weights * rot_cosine_mask) + eps
         rot_cosine_loss = (
             jnp.sum(sample_weights * rot_cosine_mask * (1.0 - rot_cosine))
@@ -412,12 +531,13 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         )
 
         bc_loss = (
-            action_mse_loss
+            action_regression_loss
             + xyz_norm_loss_weight * xyz_norm_loss
             + xyz_relative_norm_loss_weight * xyz_relative_norm_loss
             + rot_norm_loss_weight * rot_norm_loss
             + xyz_cosine_loss_weight * xyz_cosine_loss
             + rot_cosine_loss_weight * rot_cosine_loss
+            + inactive_xyz_loss_weight * inactive_xyz_loss
         )
 
         # Metrics for monitoring.
@@ -430,12 +550,22 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         info = {
             "actor_loss": bc_loss,
             "bc_loss": bc_loss,
-            "bc_action_mse_loss": action_mse_loss,
+            "bc_action_regression_loss": action_regression_loss,
+            "bc_xyz_regression_loss": xyz_regression_loss,
+            "bc_left_xyz_regression_loss": left_xyz_regression_loss,
+            "bc_right_xyz_regression_loss": right_xyz_regression_loss,
+            "bc_rot_regression_loss": rot_regression_loss,
+            "bc_action_mse_loss": xyz_mse_loss + rot_mse_weight * rot_mse_loss,
             "bc_xyz_mse_loss": xyz_mse_loss,
+            "bc_left_xyz_mse_loss": left_xyz_mse_loss,
+            "bc_right_xyz_mse_loss": right_xyz_mse_loss,
             "bc_rot_mse_loss": rot_mse_loss,
             "bc_norm_loss": xyz_norm_loss,
             "bc_xyz_norm_loss": xyz_norm_loss,
             "bc_xyz_relative_norm_loss": xyz_relative_norm_loss,
+            "bc_inactive_xyz_loss": inactive_xyz_loss,
+            "bc_left_inactive_xyz_loss": left_inactive_xyz_loss,
+            "bc_right_inactive_xyz_loss": right_inactive_xyz_loss,
             "bc_rot_norm_loss": rot_norm_loss,
             "bc_cosine_loss": xyz_cosine_loss,
             "bc_xyz_cosine_loss": xyz_cosine_loss,
@@ -452,8 +582,14 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
             "bc_rot_action_norm_pred": pred_rot_norm.mean(),
             "bc_rot_action_norm_target": target_rot_norm.mean(),
             "bc_xyz_norm_ratio": xyz_norm_ratio,
-            "bc_active_xyz_ratio": active_xyz_mask.mean(),
-            "bc_sample_weight_mean": sample_weights.mean(),
+            "bc_active_xyz_ratio": 0.5 * (
+                left_active_mask.mean() + right_active_mask.mean()
+            ),
+            "bc_left_active_xyz_ratio": left_active_mask.mean(),
+            "bc_right_active_xyz_ratio": right_active_mask.mean(),
+            "bc_sample_weight_mean": 0.5 * (
+                left_weights.mean() + right_weights.mean()
+            ),
         }
 
         return bc_loss, info

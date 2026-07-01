@@ -137,14 +137,12 @@ class OpenArmEnv(gym.Env):
         hz=5,
         fake_env=False,
         save_video=False,
-        use_viser=False, # Deprecated but kept for compatibility
         config: DefaultOpenArmConfig = None,
         max_episode_length=100,
     ):
         self.hz = hz
         self.fake_env = fake_env
         self.save_video = save_video
-        self.viser = None # Viser disabled by default in Env to avoid conflicts
         self.config = config or DefaultOpenArmConfig()
         self.max_episode_length = max_episode_length
         self.arm = "both"
@@ -337,10 +335,8 @@ class OpenArmEnv(gym.Env):
         dt = time.time() - start_time
         time.sleep(max(0, (1.0 / self.hz) - dt))
 
-        # 更新状态与可视化
+        # 更新状态
         self._update_currpos()
-        # if self.viser:
-        #     self.render()
 
         # 计算奖励与结束标志
         ob = self._get_obs()
@@ -387,7 +383,7 @@ class OpenArmEnv(gym.Env):
         return {"images": images, "state": state_observation}
 
     def render(self, mode="human"):
-        """更新 3D 可视化 (已移至 Server 端)"""
+        """Render method for Gym compatibility. Visualization is handled by Server."""
         pass
 
     def reset(self, **kwargs):
@@ -398,27 +394,24 @@ class OpenArmEnv(gym.Env):
         self.cycle_count += 1
         # 总是执行关节回零 (确保每次 Reset 都回到正确的初始位置)
         self.go_to_rest()
-        
+
         self.curr_path_length = 0
         self.currpos = self.resetpos.copy()
         self.currvel = np.zeros((2, 6))
-        
+
         self.gripper_binary_state = np.zeros((2,), dtype=int)
-        
+
         # 发送复位指令 (这一步其实是多余的，因为 go_to_rest 已经回零了，
         # 但为了更新 self.currpos 对应的 Cartesian 状态，保留也无妨，
         # 或者应该在 go_to_rest 后直接 update_currpos)
-        # self._send_pos_command(self.currpos) 
+        # self._send_pos_command(self.currpos)
         # Better: Just update current state from server
         self._update_currpos()
         self.sync_binary_gripper_state_from_position()
-        
-        # if self.viser:
-        #     self.render()
-            
+
         # Update initial reset pose for station keeping of inactive arms
         self.initial_reset_pose = self.currpos.copy()
-        
+
         return self._get_obs(), {}
 
     def go_to_rest(self):

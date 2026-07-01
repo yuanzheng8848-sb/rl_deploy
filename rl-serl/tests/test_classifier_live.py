@@ -5,14 +5,18 @@ This uses the same task config and wrapper stack as the actor:
     config.get_environment(fake_env=False, classifier=True)
 
 The displayed reward is exactly the reward returned by env.step(...), i.e. the
-same value the actor stores during training. It is not recomputed in this script.
+same value the actor stores during training. For debugging, the script also
+recomputes and displays the raw classifier probability before thresholding.
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 import cv2
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -28,6 +32,7 @@ for path in (
 
 import compat  # noqa: E402,F401
 from experiments.mappings import CONFIG_MAPPING  # noqa: E402
+from rl_launcher.networks import load_classifier_func  # noqa: E402
 
 
 def parse_args():
@@ -57,7 +62,7 @@ def to_display_bgr(img):
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
-def panel_for_image(name, img, width, height, reward, done):
+def panel_for_image(name, img, width, height, reward, prob, done):
     if img is None:
         panel = np.zeros((height, width, 3), dtype=np.uint8)
     else:
@@ -85,8 +90,18 @@ def panel_for_image(name, img, width, height, reward, done):
     )
     cv2.putText(
         panel,
-        f"done={bool(done)}",
+        f"prob={float(prob):.3f}",
         (12, 94),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        f"done={bool(done)}",
+        (12, 124),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
         (255, 255, 0),
@@ -109,10 +124,26 @@ def main():
     print(f"Classifier threshold: {getattr(config, 'classifier_threshold', None)}")
     print(f"Classifier ckpt: {getattr(config, 'classifier_ckpt_path', None)}")
     print("Reward shown here is env.step(...) reward from the actor wrapper path.")
+    print("Prob is recomputed from the same checkpoint for debugging before thresholding.")
     print("Press q or ESC to quit.")
+
+    threshold = float(getattr(config, "classifier_threshold", 0.5))
+    classifier_logits = load_classifier_func(
+        key=jax.random.PRNGKey(0),
+        sample=env.observation_space.sample(),
+        image_keys=classifier_keys,
+        checkpoint_path=os.path.abspath(getattr(config, "classifier_ckpt_path")),
+    )
+
+    def classifier_prob(obs):
+        logits = classifier_logits(obs)
+        logits = jnp.squeeze(logits)
+        prob = jax.nn.sigmoid(logits)
+        return float(np.asarray(jax.device_get(prob)))
 
     obs, _ = env.reset()
     reward = 0.0
+    prob = classifier_prob(obs)
     done = False
     delay = max(1, int(1000 / max(args.fps, 1.0)))
 
@@ -121,6 +152,7 @@ def main():
             action = np.zeros(env.action_space.shape, dtype=np.float32)
             obs, reward, done, truncated, info = env.step(action)
             done = bool(done or truncated)
+            prob = classifier_prob(obs)
 
             panels = []
             for key in image_keys:
@@ -131,11 +163,13 @@ def main():
                         args.panel_width,
                         args.panel_height,
                         reward,
+                        prob,
                         done,
                     )
                 )
             cv2.imshow(args.window, np.concatenate(panels, axis=1))
             print(
+                f"prob={prob:.3f} threshold={threshold:.3f} "
                 f"reward={float(np.asarray(reward)):.3f} "
                 f"done={done} succeed={info.get('succeed') if isinstance(info, dict) else None}"
             )

@@ -16,19 +16,54 @@ Usage:
   python train_rlpd.py --exp_name openarm_pickplace --actor
   python train_rlpd.py --exp_name openarm_pickplace --eval --eval_n_trajs 10
 """
+import os
+import sys
+
+
+def _argv_flag_enabled(name):
+    for arg in sys.argv[1:]:
+        if arg == f"--{name}":
+            return True
+        if arg.startswith(f"--{name}="):
+            return arg.split("=", 1)[1].lower() in ("1", "true", "t", "yes", "y")
+    return False
+
+
+def _append_xla_flag(flag):
+    current = os.environ.get("XLA_FLAGS", "")
+    if flag not in current.split():
+        os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
+
+
+# Must be set before importing compat/JAX. The default JAX preallocation on this
+# machine leaves too little room for actor/eval. 0.56 is about 9 GiB when the
+# previous default preallocation was about 12 GiB.
+if _argv_flag_enabled("learner"):
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.56")
+elif _argv_flag_enabled("actor"):
+    # Actor should reserve a fixed small pool on startup instead of letting
+    # cuDNN autotune probe huge temporary workspaces while learner is running.
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.31")
+    _append_xla_flag("--xla_gpu_autotune_level=0")
+
 import compat  # noqa: F401  (sets sys.path + CUDA/JAX patches; must be first)
 
 import copy
 import glob
-import os
 import pickle as pkl
 import time
 from collections import deque
 
+import cv2
 import numpy as np
 import tqdm
 from absl import app, flags
 from flax.training import checkpoints
+try:
+    from pynput import keyboard
+except Exception:  # pragma: no cover - optional desktop dependency
+    keyboard = None
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +74,7 @@ from rl_launcher.agents import (
     make_wandb_logger,
 )
 from rl_launcher.data import MemoryEfficientReplayBufferDataStore, QueuedDataStore
+from rl_launcher.networks import load_classifier_func
 from rl_launcher.utils import Timer, concat_batches, TrainerClient, TrainerServer
 
 from experiments.artifacts import task_bc_checkpoint_dir, task_rlpd_checkpoint_dir, task_success_dir
@@ -69,6 +105,12 @@ flags.DEFINE_string(
 flags.DEFINE_integer("bc_checkpoint_step", 0, "BC checkpoint step, 0 = latest.")
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Checkpoint step for eval, 0 = latest.")
 flags.DEFINE_integer("eval_n_trajs", 5, "Number of evaluation trajectories.")
+flags.DEFINE_boolean(
+    "render_actor",
+    True,
+    "Render actor camera images, classifier reference probability, and keyboard reward prompts.",
+)
+flags.DEFINE_float("render_fps", 20.0, "Actor render refresh cap.")
 
 # Optional overrides (default None -> use TrainConfig value).
 flags.DEFINE_integer("max_steps", None, "Override max training steps.")
@@ -88,6 +130,45 @@ def print_green(text):
 
 def print_yellow(text):
     print(f"\033[93m {text}\033[00m")
+
+
+def make_keyboard_state():
+    return {"label": None, "quit_requested": False}
+
+
+def start_keyboard_listener(state):
+    if keyboard is None:
+        print_yellow("[Actor] pynput unavailable; keyboard labels require the OpenCV window focus.")
+        return None
+
+    def on_press(key):
+        try:
+            if key == keyboard.Key.enter:
+                state["label"] = "success"
+                print_green("[Actor] ENTER -> success requested")
+            elif key == keyboard.Key.space:
+                state["label"] = "failure"
+                print_yellow("[Actor] SPACE -> failure requested")
+            elif key == keyboard.Key.esc:
+                state["quit_requested"] = True
+                print_yellow("[Actor] ESC -> quit requested")
+        except Exception:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    return listener
+
+
+def consume_keyboard_label(state):
+    if state.get("quit_requested"):
+        state["quit_requested"] = False
+        return "quit"
+    label = state.get("label")
+    if label:
+        state["label"] = None
+        return label
+    return None
 
 
 def _cfg_value(config, name, override):
@@ -221,6 +302,101 @@ def is_intervention_mode_active(env):
     return bool(wrapper is not None and wrapper._intervention_mode)
 
 
+def image_from_obs(obs, key):
+    img = obs.get(key) if isinstance(obs, dict) else None
+    if img is None:
+        return None
+    img = np.asarray(img)
+    if img.ndim == 4 and img.shape[0] == 1:
+        img = img[0]
+    if img.ndim != 3 or img.shape[-1] != 3:
+        return None
+    return img.astype(np.uint8)
+
+
+def make_classifier_reference(config, env):
+    classifier_keys = list(getattr(config, "classifier_keys", []) or [])
+    checkpoint_path = getattr(config, "classifier_ckpt_path", None)
+    if not classifier_keys or not checkpoint_path:
+        print_yellow("classifier reference disabled: missing classifier_keys or checkpoint path.")
+        return None, 0.0
+    checkpoint_path = os.path.abspath(checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        print_yellow(f"classifier reference disabled: checkpoint path not found: {checkpoint_path}")
+        return None, 0.0
+
+    classifier_logits = load_classifier_func(
+        key=jax.random.PRNGKey(0),
+        sample=env.observation_space.sample(),
+        image_keys=classifier_keys,
+        checkpoint_path=checkpoint_path,
+    )
+    threshold = float(getattr(config, "classifier_threshold", 0.5))
+
+    def classifier_prob(obs):
+        logits = classifier_logits(obs)
+        prob = jax.nn.sigmoid(jnp.squeeze(logits))
+        return float(np.asarray(jax.device_get(prob)))
+
+    return classifier_prob, threshold
+
+
+def render_actor_feedback(obs, image_keys, reward, classifier_prob, classifier_threshold, done):
+    if not FLAGS.render_actor:
+        return None
+    panels = []
+    for key in image_keys:
+        img = image_from_obs(obs, key)
+        if img is None:
+            panel = np.zeros((320, 320, 3), dtype=np.uint8)
+        else:
+            panel = cv2.resize(cv2.cvtColor(img, cv2.COLOR_RGB2BGR), (320, 320))
+        cv2.putText(panel, key, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            panel,
+            f"prob={classifier_prob:.3f}/{classifier_threshold:.2f}",
+            (12, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            f"reward={float(np.asarray(reward)):.1f} done={bool(done)}",
+            (12, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 220, 0) if float(np.asarray(reward)) > 0 else (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            "ENTER=success  SPACE=failure  q=quit",
+            (12, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        panels.append(panel)
+
+    if panels:
+        cv2.imshow("rl-serl actor reward", np.concatenate(panels, axis=1))
+    delay = max(1, int(1000 / max(float(FLAGS.render_fps), 1.0)))
+    key = cv2.waitKey(delay) & 0xFF
+    if key in (10, 13):
+        return "success"
+    if key == ord(" "):
+        return "failure"
+    if key in (27, ord("q")):
+        return "quit"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # eval
 # ---------------------------------------------------------------------------
@@ -271,6 +447,7 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
         evaluate(agent, env, sampling_rng, checkpoint_path)
         return
 
+    classifier_prob_fn, classifier_threshold = make_classifier_reference(config, env)
     max_steps = _cfg_value(config, "max_steps", FLAGS.max_steps)
     start_step = 0
     buffer_dir = os.path.join(checkpoint_path, "buffer") if checkpoint_path else None
@@ -296,12 +473,15 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
     client.recv_network_callback(update_params)
 
     obs, _ = env.reset()
+    keyboard_state = make_keyboard_state()
+    keyboard_listener = start_keyboard_listener(keyboard_state)
     timer = Timer()
     running_return = 0.0
     already_intervened = False
     intervention_count = 0
     intervention_steps = 0
     last_timer_stats_step = None
+    episode_len = 0
     transitions = []
     demo_transitions = []
 
@@ -309,111 +489,179 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
         total=max(max_steps - start_step, 0), initial=0, dynamic_ncols=True, desc="actor"
     )
     step = start_step
-    while step < max_steps:
-        timer.tick("total")
+    try:
+        while step < max_steps:
+            timer.tick("total")
 
-        with timer.context("sample_actions"):
-            if is_intervention_mode_active(env):
-                actions = np.zeros(env.action_space.shape, dtype=np.float32)
-            elif step < config.random_steps:
-                actions = env.action_space.sample()
-            else:
-                sampling_rng, key = jax.random.split(sampling_rng)
-                actions = agent.sample_actions(
-                    observations=jax.device_put(obs), seed=key, argmax=False
+            with timer.context("sample_actions"):
+                if is_intervention_mode_active(env):
+                    actions = np.zeros(env.action_space.shape, dtype=np.float32)
+                elif step < config.random_steps:
+                    actions = env.action_space.sample()
+                else:
+                    sampling_rng, key = jax.random.split(sampling_rng)
+                    actions = agent.sample_actions(
+                        observations=jax.device_put(obs), seed=key, argmax=False
+                    )
+                    actions = np.asarray(jax.device_get(actions))
+
+            with timer.context("step_env"):
+                next_obs, reward, done, truncated, info = env.step(actions)
+                info = dict(info) if isinstance(info, dict) else {}
+                sampled_transition = info.get("sampled_transition")
+
+                if info.get("intervention_idle", False):
+                    classifier_prob = classifier_prob_fn(obs) if classifier_prob_fn is not None else 0.0
+                    cv2_label = render_actor_feedback(
+                        obs,
+                        config.image_keys,
+                        0.0,
+                        classifier_prob,
+                        classifier_threshold,
+                        False,
+                    )
+                    key_label = consume_keyboard_label(keyboard_state) or cv2_label
+                    if key_label == "quit":
+                        break
+                    timer.tock("total")
+                    if step % config.log_period == 0 and last_timer_stats_step != step:
+                        client.request("send-stats", {"timer": timer.get_average_times(reset=False)})
+                        last_timer_stats_step = step
+                    continue
+
+                classifier_prob = classifier_prob_fn(next_obs) if classifier_prob_fn is not None else 0.0
+                cv2_label = render_actor_feedback(
+                    next_obs,
+                    config.image_keys,
+                    reward,
+                    classifier_prob,
+                    classifier_threshold,
+                    done or truncated,
                 )
-                actions = np.asarray(jax.device_get(actions))
+                key_label = consume_keyboard_label(keyboard_state) or cv2_label
+                if key_label == "quit":
+                    break
+                keyboard_reward = None
+                keyboard_done = False
+                if key_label == "success":
+                    keyboard_reward = 1.0
+                    keyboard_done = True
+                    print_green("[Actor] ENTER -> success reward=1, ending episode.")
+                elif key_label == "failure":
+                    keyboard_reward = 0.0
+                    keyboard_done = True
+                    print_yellow("[Actor] SPACE -> failure reward=0, restarting episode.")
 
-        with timer.context("step_env"):
-            next_obs, reward, done, truncated, info = env.step(actions)
-            sampled_transition = (
-                info.get("sampled_transition") if isinstance(info, dict) else None
-            )
+                intervened = "intervene_action" in info
+                if intervened:
+                    actions = np.asarray(info["intervene_action"], dtype=np.float32)
+                    intervention_steps += 1
+                    if not already_intervened:
+                        intervention_count += 1
+                    already_intervened = True
+                else:
+                    already_intervened = False
 
-            if isinstance(info, dict) and info.get("intervention_idle", False):
-                timer.tock("total")
-                if step % config.log_period == 0 and last_timer_stats_step != step:
-                    client.request("send-stats", {"timer": timer.get_average_times(reset=False)})
-                    last_timer_stats_step = step
-                continue
+                if sampled_transition is not None:
+                    transition = {
+                        "observations": sampled_transition["observations"],
+                        "actions": np.asarray(sampled_transition["actions"], dtype=np.float32),
+                        "next_observations": sampled_transition["next_observations"],
+                        "rewards": np.asarray(sampled_transition["rewards"], dtype=np.float32),
+                        "masks": np.asarray(1.0 - float(sampled_transition["dones"]), dtype=np.float32),
+                        "dones": bool(sampled_transition["dones"]),
+                        "infos": copy.deepcopy(sampled_transition.get("infos", info)),
+                    }
+                    reward = transition["rewards"]
+                    done = transition["dones"]
+                    truncated = bool(sampled_transition.get("truncated", False))
+                    intervened = True
+                else:
+                    transition = {
+                        "observations": obs,
+                        "actions": np.asarray(actions, dtype=np.float32),
+                        "next_observations": next_obs,
+                        "rewards": np.asarray(reward, dtype=np.float32),
+                        "masks": np.asarray(1.0 - float(done), dtype=np.float32),
+                        "dones": bool(done),
+                        "infos": copy.deepcopy(info),
+                    }
 
-            intervened = "intervene_action" in info
-            if intervened:
-                actions = np.asarray(info["intervene_action"], dtype=np.float32)
-                intervention_steps += 1
-                if not already_intervened:
-                    intervention_count += 1
-                already_intervened = True
-            else:
-                already_intervened = False
+                if keyboard_reward is not None:
+                    reward = np.asarray(keyboard_reward, dtype=np.float32)
+                    done = bool(keyboard_done)
+                    truncated = False
+                    transition["rewards"] = reward
+                    transition["dones"] = done
+                    transition["masks"] = np.asarray(1.0 - float(done), dtype=np.float32)
+                    transition["infos"] = copy.deepcopy(transition["infos"])
+                    transition["infos"]["keyboard_label"] = key_label
+                    transition["infos"]["succeed"] = key_label == "success"
 
-            if sampled_transition is not None:
-                transition = {
-                    "observations": sampled_transition["observations"],
-                    "actions": np.asarray(sampled_transition["actions"], dtype=np.float32),
-                    "next_observations": sampled_transition["next_observations"],
-                    "rewards": np.asarray(sampled_transition["rewards"], dtype=np.float32),
-                    "masks": np.asarray(1.0 - float(sampled_transition["dones"]), dtype=np.float32),
-                    "dones": bool(sampled_transition["dones"]),
-                    "infos": copy.deepcopy(sampled_transition.get("infos", info)),
-                }
-                reward = transition["rewards"]
-                done = transition["dones"]
-                truncated = bool(sampled_transition.get("truncated", False))
-                intervened = True
-            else:
-                transition = {
-                    "observations": obs,
-                    "actions": np.asarray(actions, dtype=np.float32),
-                    "next_observations": next_obs,
-                    "rewards": np.asarray(reward, dtype=np.float32),
-                    "masks": np.asarray(1.0 - float(done), dtype=np.float32),
-                    "dones": bool(done),
-                    "infos": copy.deepcopy(info),
-                }
+                transition["infos"] = copy.deepcopy(transition["infos"])
+                transition["infos"]["classifier_prob"] = float(classifier_prob)
+                transition["infos"]["classifier_threshold"] = float(classifier_threshold)
+                transition["infos"]["classifier_reference_success"] = bool(
+                    classifier_prob > classifier_threshold
+                )
 
-            transition["grasp_penalty"] = (
-                np.asarray(info.get("grasp_penalty", 0.0), dtype=np.float32)
-                if isinstance(info, dict)
-                else np.asarray(0.0, dtype=np.float32)
-            )
+                transition["grasp_penalty"] = np.asarray(
+                    info.get("grasp_penalty", 0.0), dtype=np.float32
+                )
 
-            data_store.insert(transition)
-            transitions.append(transition.copy())
-            if intervened:
-                intvn_data_store.insert(transition)
-                demo_transitions.append(transition.copy())
+                data_store.insert(transition)
+                transitions.append(transition.copy())
+                if intervened:
+                    intvn_data_store.insert(transition)
+                    demo_transitions.append(transition.copy())
 
-            obs = next_obs
-            running_return += float(np.asarray(reward))
+                obs = next_obs
+                running_return += float(np.asarray(reward))
+                episode_len += 1
 
-            if done or truncated:
-                if isinstance(info, dict) and "episode" in info and isinstance(info["episode"], dict):
+                if done or truncated:
+                    if "episode" not in info or not isinstance(info.get("episode"), dict):
+                        info["episode"] = {
+                            "r": running_return,
+                            "l": episode_len,
+                            "t": 0.0,
+                        }
                     info["episode"]["intervention_count"] = intervention_count
                     info["episode"]["intervention_steps"] = intervention_steps
+                    info["episode"]["keyboard_label"] = key_label
+                    info["episode"]["classifier_prob"] = float(classifier_prob)
+                    info["episode"]["classifier_reference_success"] = bool(
+                        classifier_prob > classifier_threshold
+                    )
                     client.request("send-stats", {"environment": info})
-                running_return = 0.0
-                intervention_count = 0
-                intervention_steps = 0
-                already_intervened = False
+                    running_return = 0.0
+                    episode_len = 0
+                    intervention_count = 0
+                    intervention_steps = 0
+                    already_intervened = False
+                    client.update()
+                    obs, _ = env.reset()
+
+            if step > 0 and step % config.steps_per_update == 0:
                 client.update()
-                obs, _ = env.reset()
 
-        if step > 0 and step % config.steps_per_update == 0:
-            client.update()
+            if checkpoint_path and step > 0 and step % config.checkpoint_period == 0:
+                save_transition_dump(checkpoint_path, "buffer", step, transitions)
+                save_transition_dump(checkpoint_path, "demo_buffer", step, demo_transitions)
+                transitions = []
+                demo_transitions = []
 
-        if checkpoint_path and step > 0 and step % config.checkpoint_period == 0:
-            save_transition_dump(checkpoint_path, "buffer", step, transitions)
-            save_transition_dump(checkpoint_path, "demo_buffer", step, demo_transitions)
-            transitions = []
-            demo_transitions = []
-
-        timer.tock("total")
-        if step % config.log_period == 0 and last_timer_stats_step != step:
-            client.request("send-stats", {"timer": timer.get_average_times()})
-            last_timer_stats_step = step
-        step += 1
-        pbar.update(1)
+            timer.tock("total")
+            if step % config.log_period == 0 and last_timer_stats_step != step:
+                client.request("send-stats", {"timer": timer.get_average_times()})
+                last_timer_stats_step = step
+            step += 1
+            pbar.update(1)
+    finally:
+        if keyboard_listener is not None:
+            keyboard_listener.stop()
+        if FLAGS.render_actor:
+            cv2.destroyAllWindows()
     pbar.close()
 
 
@@ -548,11 +796,12 @@ def main(_):
     rng = jax.random.PRNGKey(config.seed if hasattr(config, "seed") else FLAGS.seed)
     rng, sampling_rng = jax.random.split(rng)
 
-    # learner uses a fake env (no hardware); actor/eval use the real env + classifier reward.
+    # learner uses a fake env (no hardware). Eval keeps classifier reward.
+    # Actor uses keyboard reward; classifier is loaded separately as a reference.
     env = config.get_environment(
         fake_env=FLAGS.learner or FLAGS.mock,
         save_video=FLAGS.save_video,
-        classifier=(FLAGS.actor or FLAGS.eval),
+        classifier=FLAGS.eval,
     )
 
     print(f"Exp: {FLAGS.exp_name} | image_keys={config.image_keys}")

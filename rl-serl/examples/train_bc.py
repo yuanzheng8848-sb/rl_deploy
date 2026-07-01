@@ -3,6 +3,7 @@
 import compat  # noqa: F401  (sys.path + CUDA/JAX patches; must be first)
 
 import csv
+import json
 import os
 
 import jax
@@ -28,13 +29,24 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("exp_name", "openarm_pickplace", "Experiment name in CONFIG_MAPPING.")
 flags.DEFINE_string("bc_checkpoint_path", None, "Defaults to task checkpoints_bc.")
 flags.DEFINE_string("success_dir", None, "Defaults to task success demo directory.")
-flags.DEFINE_integer("train_steps", 20000, "Number of BC update steps.")
+flags.DEFINE_integer("train_steps", 1000, "Number of BC update steps.")
 flags.DEFINE_integer("batch_size", None, "Defaults to task config batch_size.")
 flags.DEFINE_integer("checkpoint_period", 1000, "Checkpoint save period.")
 flags.DEFINE_integer("plot_period", 500, "Period for generating training plots.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_boolean("debug", False, "Disable wandb when true.")
 flags.DEFINE_boolean("skip_zero_actions", True, "Skip zero-action demo transitions.")
+flags.DEFINE_enum(
+    "bc_actor_loss_type",
+    "mse",
+    ["mse", "huber"],
+    "Continuous actor BC regression loss. Huber is more robust to noisy demo labels.",
+)
+flags.DEFINE_float(
+    "bc_huber_delta",
+    0.10,
+    "Huber delta for continuous actor BC loss when --bc_actor_loss_type=huber.",
+)
 flags.DEFINE_float(
     "bc_active_xyz_threshold",
     0.05,
@@ -42,8 +54,8 @@ flags.DEFINE_float(
 )
 flags.DEFINE_float(
     "bc_active_xyz_weight",
-    3.0,
-    "Extra BC loss weight for active XYZ action samples.",
+    4.0,
+    "Extra per-arm BC loss weight for active XYZ action samples.",
 )
 flags.DEFINE_float(
     "bc_xyz_norm_loss_weight",
@@ -59,6 +71,16 @@ flags.DEFINE_float(
     "bc_xyz_cosine_loss_weight",
     0.02,
     "Small auxiliary direction loss weight for active XYZ actions.",
+)
+flags.DEFINE_float(
+    "bc_inactive_xyz_loss_weight",
+    0.10,
+    "Per-arm penalty for predicted XYZ motion when that arm's demo XYZ action is inactive.",
+)
+flags.DEFINE_float(
+    "bc_rot_mse_weight",
+    0.10,
+    "Relative weight for rotation regression in the continuous actor BC loss.",
 )
 
 
@@ -81,11 +103,15 @@ def create_agent(config, env):
         image_keys=config.image_keys,
         encoder_type=config.encoder_type,
         discount=config.discount,
+        bc_actor_loss_type=FLAGS.bc_actor_loss_type,
+        bc_huber_delta=FLAGS.bc_huber_delta,
         bc_active_xyz_threshold=FLAGS.bc_active_xyz_threshold,
         bc_active_xyz_weight=FLAGS.bc_active_xyz_weight,
         bc_xyz_norm_loss_weight=FLAGS.bc_xyz_norm_loss_weight,
         bc_xyz_relative_norm_loss_weight=FLAGS.bc_xyz_relative_norm_loss_weight,
         bc_xyz_cosine_loss_weight=FLAGS.bc_xyz_cosine_loss_weight,
+        bc_inactive_xyz_loss_weight=FLAGS.bc_inactive_xyz_loss_weight,
+        bc_rot_mse_weight=FLAGS.bc_rot_mse_weight,
     )
     return jax.device_put(jax.tree_util.tree_map(jnp.array, agent), sharding)
 
@@ -304,8 +330,9 @@ def main(_):
         raise ValueError(f"Experiment {FLAGS.exp_name!r} not found in CONFIG_MAPPING.")
 
     config = CONFIG_MAPPING[FLAGS.exp_name]()
+    default_checkpoint_path = os.fspath(task_bc_checkpoint_dir(FLAGS.exp_name))
     checkpoint_path = os.path.abspath(
-        FLAGS.bc_checkpoint_path or task_bc_checkpoint_dir(FLAGS.exp_name)
+        FLAGS.bc_checkpoint_path or default_checkpoint_path
     )
     success_dir = os.path.abspath(FLAGS.success_dir or task_success_dir(FLAGS.exp_name))
     batch_size = FLAGS.batch_size or config.batch_size
@@ -314,6 +341,29 @@ def main(_):
     print_green(f"[BC] exp={FLAGS.exp_name}")
     print_green(f"[BC] success demos={success_dir}")
     print_green(f"[BC] checkpoint_path={checkpoint_path}")
+    with open(os.path.join(checkpoint_path, "bc_config.json"), "w") as handle:
+        json.dump(
+            {
+                "exp_name": FLAGS.exp_name,
+                "success_dir": success_dir,
+                "checkpoint_path": checkpoint_path,
+                "skip_zero_actions": FLAGS.skip_zero_actions,
+                "bc_actor_loss_type": FLAGS.bc_actor_loss_type,
+                "bc_huber_delta": FLAGS.bc_huber_delta,
+                "bc_active_xyz_threshold": FLAGS.bc_active_xyz_threshold,
+                "bc_active_xyz_weight": FLAGS.bc_active_xyz_weight,
+                "bc_xyz_norm_loss_weight": FLAGS.bc_xyz_norm_loss_weight,
+                "bc_xyz_relative_norm_loss_weight": FLAGS.bc_xyz_relative_norm_loss_weight,
+                "bc_xyz_cosine_loss_weight": FLAGS.bc_xyz_cosine_loss_weight,
+                "bc_inactive_xyz_loss_weight": FLAGS.bc_inactive_xyz_loss_weight,
+                "bc_rot_mse_weight": FLAGS.bc_rot_mse_weight,
+                "train_steps": FLAGS.train_steps,
+                "batch_size": batch_size,
+                "seed": FLAGS.seed,
+            },
+            handle,
+            indent=2,
+        )
 
     env = config.get_environment(fake_env=True, classifier=False)
     agent = create_agent(config, env)
@@ -331,7 +381,8 @@ def main(_):
         skip_zero_action=FLAGS.skip_zero_actions,
     )
     print_green(
-        f"[BC] loaded success demos: {files} files, {transitions} transitions, {skipped} skipped"
+        f"[BC] loaded success demos: {files} files, {transitions} transitions, "
+        f"{skipped} skipped"
     )
     if len(buffer) == 0:
         raise ValueError(f"No usable success demo transitions found in {success_dir}")
