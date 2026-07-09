@@ -65,7 +65,7 @@ class MockCamera:
     def get_data(self, viz=False):
         # Return black image (all zeros)
         # RealsenseCamera usually returns [color, depth] (list)
-        # OpenCVCamera usually returns frame (ndarray)
+        # USB camera usually returns frame (ndarray)
         # We will return [color, None] to mimic Realsense structure mostly, 
         # or just color if caller handles it.
         # LocalOpenArmEnv handles list or ndarray.

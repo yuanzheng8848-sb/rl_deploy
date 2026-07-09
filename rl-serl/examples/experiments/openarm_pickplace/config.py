@@ -1,7 +1,7 @@
 """OpenArm pick-and-place task config for rl-serl.
 
 Mirrors hil-serl/examples/experiments/ram_insertion/config.py. Assembles the
-wrapper stack (migrated OpenArm wrappers + serl_launcher generic wrappers) and,
+wrapper stack (migrated OpenArm wrappers + rl_launcher generic wrappers) and,
 when classifier=True, attaches the vision reward classifier via
 MultiCameraBinaryRewardClassifierWrapper.
 
@@ -22,11 +22,12 @@ from openarm_env.envs.wrappers import (
     GripperPenaltyWrapper,
     DualSpacemouseIntervention,
 )
-from franka_env.envs.wrappers import MultiCameraBinaryRewardClassifierWrapper
+from openarm_env.envs.reward_wrappers import MultiCameraBinaryRewardClassifierWrapper
 
 from rl_launcher.wrappers import SERLObsWrapper, ChunkingWrapper
 
 from experiments.config import DefaultTrainingConfig
+from experiments.artifacts import task_classifier_ckpt_dir
 
 
 # Image streams fed to the policy encoder (three cameras).
@@ -45,9 +46,7 @@ CLASSIFIER_SUCCESS_TAIL_FRAMES = 30
 CLASSIFIER_FAILURE_HEAD_FRAMES = 30
 
 # Default classifier checkpoint location used by train/eval render and reward reference.
-DEFAULT_CLASSIFIER_CKPT = (
-    "/home/sj/Desktop/zy/rl-serl/examples/experiments/openarm_pickplace/classifier_ckpt"
-)
+DEFAULT_CLASSIFIER_CKPT = str(task_classifier_ckpt_dir("openarm_pickplace"))
 
 
 class EnvConfig(DefaultOpenArmConfig):

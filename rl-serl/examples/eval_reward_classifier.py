@@ -34,7 +34,7 @@ from absl import app, flags
 from flax.training import checkpoints
 from tqdm import tqdm
 
-from serl_launcher.networks.reward_classifier import create_classifier
+from rl_launcher.networks import create_classifier
 from experiments.artifacts import task_classifier_ckpt_dir, task_success_dir
 from experiments.mappings import CONFIG_MAPPING
 

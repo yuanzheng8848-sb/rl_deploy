@@ -1,0 +1,13 @@
+use_initial: true
+use_manipulability: true # jerking
+weight:
+  # the former 2 are arm
+  end_effector_position:  30.0
+  end_effector_orientation: 5.0
+  chest_position: 5.0 # 50
+  chest_orientation: 2.5 # 25
+  rest: 2.0 # 4.0
+  limit: 100.0
+  manipulability: 0.0003
+  collision: 80.0
+collision_margin: 0.02

@@ -33,10 +33,10 @@ from gymnasium import spaces
 from jax import numpy as jnp
 from tqdm import tqdm
 
-from serl_launcher.data.data_store import MemoryEfficientReplayBufferDataStore
-from serl_launcher.networks.reward_classifier import create_classifier
-from serl_launcher.utils.train_utils import concat_batches
-from serl_launcher.vision.data_augmentations import batched_random_crop
+from rl_launcher.data import MemoryEfficientReplayBufferDataStore
+from rl_launcher.networks import create_classifier
+from rl_launcher.utils import concat_batches
+from rl_launcher.vision import batched_random_crop
 
 from experiments.artifacts import (
     task_classifier_ckpt_dir,

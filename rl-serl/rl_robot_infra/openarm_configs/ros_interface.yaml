@@ -1,0 +1,13 @@
+# ipc socket addresses for zmq bridge
+socket_addr:
+  pub: ipc:///dev/shm/ros_zmq_bridge_sub.sock
+  sub: ipc:///dev/shm/ros_zmq_bridge_pub.sock
+# zmq topic names
+topic_name:
+  joint_states: joint_states
+  joint_command: joint_command
+  ee_pose: ee_poses
+# polling time out for zmq receiver thread (milliseconds)
+receiver_poll_timeout_ms: 100
+# publish gripper command via zmq or not
+enable_gripper: true

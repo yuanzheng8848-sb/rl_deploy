@@ -1,0 +1,21 @@
+# OpenArm CAN deployment configuration.
+#
+# New machines may enumerate adapters differently. Keep the interface names here
+# as the single source of truth for the Python controller and deployment checks.
+
+left:
+  interface: can0
+  can_fd: false
+
+right:
+  interface: can1
+  can_fd: false
+
+bitrate: 1000000
+dbitrate: 5000000
+
+motors:
+  arm_send_ids: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+  arm_recv_ids: [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+  gripper_send_id: 0x08
+  gripper_recv_id: 0x18

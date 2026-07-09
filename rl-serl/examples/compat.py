@@ -1,16 +1,13 @@
 """Runtime compatibility shims for rl-serl.
 
 Import this module FIRST (before jax / flax) in every entrypoint. It:
-  1. Wires up sys.path so that rl-serl can import its own packages AND the
-     reused upstream code (no `pip install -e` required):
-       - rl-serl/rl_launcher               (forwarding layer over serl_launcher)
-       - rl-serl/rl_robot_infra            (OpenArm env / wrappers / server)
-       - hil-serl/serl_launcher            (SAC/RLPD/encoder/buffer/classifier networks)
-       - hil-serl/serl_robot_infra         (transformations, reward classifier wrapper)
-       - moqi_workspace/pyroki             (realsense_camera, robot_ik_solver, viser_base)
-       - moqi_workspace/openarm            (openarm_controller_2)
-     NOTE: moqi_workspace/rl_deploy is intentionally NOT added — rl-serl must not
-     depend on rl_deploy (it will be deleted).
+  1. Wires up sys.path so that rl-serl can import its own packages (no
+     `pip install -e` required):
+       - rl-serl/rl_launcher      (SAC/RLPD/encoder/buffer/classifier networks)
+       - rl-serl/rl_robot_infra   (OpenArm env / wrappers / server)
+     NOTE: OpenArm hardware control, camera, IK, configs, and robot description
+     now live under rl-serl/rl_robot_infra. The old rl_deploy/hil-serl
+     workspaces are intentionally NOT added; rl-serl must not depend on them.
   2. Configures JAX CUDA library paths before JAX touches the GPU.
   3. Applies monkey-patches that keep older HIL-SERL/Flax code working on newer JAX.
 
@@ -32,10 +29,6 @@ ZY_ROOT = RL_SERL_ROOT.parent
 _REUSE_PATHS = [
     RL_SERL_ROOT / "rl_launcher",       # rl-serl own packages (no pip install needed)
     RL_SERL_ROOT / "rl_robot_infra",
-    ZY_ROOT / "hil-serl" / "serl_launcher",
-    ZY_ROOT / "hil-serl" / "serl_robot_infra",
-    ZY_ROOT / "moqi_workspace" / "pyroki",
-    ZY_ROOT / "moqi_workspace" / "openarm",
 ]
 
 for _p in _REUSE_PATHS:

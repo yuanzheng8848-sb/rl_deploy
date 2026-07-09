@@ -3,11 +3,15 @@ from setuptools import setup, find_packages
 setup(
     name="rl_launcher",
     version="0.1.0",
-    description="Thin forwarding layer over serl_launcher for OpenArm rl-serl.",
+    description="RL network, agent, data, and launcher utilities for OpenArm rl-serl.",
     packages=find_packages(),
     install_requires=[
-        # serl_launcher itself is reused via sys.path (examples.compat) or
-        # installed separately from hil-serl/serl_launcher.
+        "zmq",
+        "typing",
+        "typing_extensions",
+        "opencv-python",
+        "lz4",
+        "agentlace@git+https://github.com/youliangtan/agentlace.git@cf2c337c5e3694cdbfc14831b239bd657bc4894d",
     ],
     zip_safe=False,
 )

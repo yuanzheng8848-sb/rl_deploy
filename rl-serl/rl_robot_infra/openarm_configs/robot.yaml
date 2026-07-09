@@ -1,0 +1,24 @@
+description:
+  package_path: openarm
+  urdf_relative_path: openarm_description/urdf/robot/openarm_bimanual.urdf
+
+end_effector_link_names: 
+  - openarm_left_link7
+  - openarm_right_link7
+chest:
+  tracking: false
+  link_name: openarm_body_link0
+
+collision:
+  disabled_pairs:
+    enable: true
+    srdf_relative_path: openarm_description/urdf/robot/self_collision/openarm.srdf
+  sphere_and_capsule_only: true
+  world:
+    enable: true
+    desktop:
+      enable: true
+      height_offset: 0.01
+    side_walls:
+      enable: true
+      side_offset: 0.6

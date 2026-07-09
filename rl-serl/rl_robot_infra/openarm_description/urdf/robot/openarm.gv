@@ -1,0 +1,80 @@
+digraph G {
+node [shape=box];
+"world" [label="world"];
+"openarm_body_link0" [label="openarm_body_link0"];
+"openarm_left_link0" [label="openarm_left_link0"];
+"openarm_left_link1" [label="openarm_left_link1"];
+"openarm_left_link2" [label="openarm_left_link2"];
+"openarm_left_link3" [label="openarm_left_link3"];
+"openarm_left_link4" [label="openarm_left_link4"];
+"openarm_left_link5" [label="openarm_left_link5"];
+"openarm_left_link6" [label="openarm_left_link6"];
+"openarm_left_link7" [label="openarm_left_link7"];
+"openarm_left_hand" [label="openarm_left_hand"];
+"openarm_left_right_finger" [label="openarm_left_right_finger"];
+"openarm_left_left_finger" [label="openarm_left_left_finger"];
+"openarm_left_hand_tcp" [label="openarm_left_hand_tcp"];
+"openarm_right_link0" [label="openarm_right_link0"];
+"openarm_right_link1" [label="openarm_right_link1"];
+"openarm_right_link2" [label="openarm_right_link2"];
+"openarm_right_link3" [label="openarm_right_link3"];
+"openarm_right_link4" [label="openarm_right_link4"];
+"openarm_right_link5" [label="openarm_right_link5"];
+"openarm_right_link6" [label="openarm_right_link6"];
+"openarm_right_link7" [label="openarm_right_link7"];
+"openarm_right_hand" [label="openarm_right_hand"];
+"openarm_right_right_finger" [label="openarm_right_right_finger"];
+"openarm_right_left_finger" [label="openarm_right_left_finger"];
+"openarm_right_hand_tcp" [label="openarm_right_hand_tcp"];
+node [shape=ellipse, color=blue, fontcolor=blue];
+"world" -> "openarm_body_world_joint" [label="xyz: 0 0 0 \nrpy: 0 -0 0"]
+"openarm_body_world_joint" -> "openarm_body_link0"
+"openarm_body_link0" -> "openarm_left_openarm_body_link0_joint" [label="xyz: 0 0.031 0.698 \nrpy: -1.5708 0 0"]
+"openarm_left_openarm_body_link0_joint" -> "openarm_left_link0"
+"openarm_left_link0" -> "openarm_left_joint1" [label="xyz: 0 0 0.0625 \nrpy: 0 -0 0"]
+"openarm_left_joint1" -> "openarm_left_link1"
+"openarm_left_link1" -> "openarm_left_joint2" [label="xyz: -0.0301 0 0.06 \nrpy: -1.5708 0 0"]
+"openarm_left_joint2" -> "openarm_left_link2"
+"openarm_left_link2" -> "openarm_left_joint3" [label="xyz: 0.0301 0 0.06625 \nrpy: 0 -0 0"]
+"openarm_left_joint3" -> "openarm_left_link3"
+"openarm_left_link3" -> "openarm_left_joint4" [label="xyz: -0 0.0315 0.15375 \nrpy: 0 -0 0"]
+"openarm_left_joint4" -> "openarm_left_link4"
+"openarm_left_link4" -> "openarm_left_joint5" [label="xyz: 0 -0.0315 0.0955 \nrpy: 0 -0 0"]
+"openarm_left_joint5" -> "openarm_left_link5"
+"openarm_left_link5" -> "openarm_left_joint6" [label="xyz: 0.0375 0 0.1205 \nrpy: 0 -0 0"]
+"openarm_left_joint6" -> "openarm_left_link6"
+"openarm_left_link6" -> "openarm_left_joint7" [label="xyz: -0.0375 0 0 \nrpy: 0 -0 0"]
+"openarm_left_joint7" -> "openarm_left_link7"
+"openarm_left_link7" -> "left_openarm_hand_joint" [label="xyz: 0 -0 0.1001 \nrpy: 0 -0 0"]
+"left_openarm_hand_joint" -> "openarm_left_hand"
+"openarm_left_hand" -> "openarm_left_finger_joint1" [label="xyz: 0 -0.006 0.015 \nrpy: 0 -0 0"]
+"openarm_left_finger_joint1" -> "openarm_left_right_finger"
+"openarm_left_hand" -> "openarm_left_finger_joint2" [label="xyz: 0 0.006 0.015 \nrpy: 0 -0 0"]
+"openarm_left_finger_joint2" -> "openarm_left_left_finger"
+"openarm_left_hand" -> "openarm_left_hand_tcp_joint" [label="xyz: 0 -0 0.08 \nrpy: 0 -0 0"]
+"openarm_left_hand_tcp_joint" -> "openarm_left_hand_tcp"
+"openarm_body_link0" -> "openarm_right_openarm_body_link0_joint" [label="xyz: 0 -0.031 0.698 \nrpy: 1.5708 -0 0"]
+"openarm_right_openarm_body_link0_joint" -> "openarm_right_link0"
+"openarm_right_link0" -> "openarm_right_joint1" [label="xyz: 0 0 0.0625 \nrpy: 0 -0 0"]
+"openarm_right_joint1" -> "openarm_right_link1"
+"openarm_right_link1" -> "openarm_right_joint2" [label="xyz: -0.0301 0 0.06 \nrpy: 1.5708 -0 0"]
+"openarm_right_joint2" -> "openarm_right_link2"
+"openarm_right_link2" -> "openarm_right_joint3" [label="xyz: 0.0301 0 0.06625 \nrpy: 0 -0 0"]
+"openarm_right_joint3" -> "openarm_right_link3"
+"openarm_right_link3" -> "openarm_right_joint4" [label="xyz: -0 0.0315 0.15375 \nrpy: 0 -0 0"]
+"openarm_right_joint4" -> "openarm_right_link4"
+"openarm_right_link4" -> "openarm_right_joint5" [label="xyz: 0 -0.0315 0.0955 \nrpy: 0 -0 0"]
+"openarm_right_joint5" -> "openarm_right_link5"
+"openarm_right_link5" -> "openarm_right_joint6" [label="xyz: 0.0375 0 0.1205 \nrpy: 0 -0 0"]
+"openarm_right_joint6" -> "openarm_right_link6"
+"openarm_right_link6" -> "openarm_right_joint7" [label="xyz: -0.0375 0 0 \nrpy: 0 -0 0"]
+"openarm_right_joint7" -> "openarm_right_link7"
+"openarm_right_link7" -> "right_openarm_hand_joint" [label="xyz: 0 -0 0.1001 \nrpy: 0 -0 0"]
+"right_openarm_hand_joint" -> "openarm_right_hand"
+"openarm_right_hand" -> "openarm_right_finger_joint1" [label="xyz: 0 -0.006 0.015 \nrpy: 0 -0 0"]
+"openarm_right_finger_joint1" -> "openarm_right_right_finger"
+"openarm_right_hand" -> "openarm_right_finger_joint2" [label="xyz: 0 0.006 0.015 \nrpy: 0 -0 0"]
+"openarm_right_finger_joint2" -> "openarm_right_left_finger"
+"openarm_right_hand" -> "openarm_right_hand_tcp_joint" [label="xyz: 0 -0 0.08 \nrpy: 0 -0 0"]
+"openarm_right_hand_tcp_joint" -> "openarm_right_hand_tcp"
+}

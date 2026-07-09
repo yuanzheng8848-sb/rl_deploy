@@ -1,7 +1,7 @@
 """OpenArm-specific gym wrappers (migrated from rl_deploy/train.py).
 
 These are the robot-specific wrappers kept for rl-serl. Task-agnostic wrappers
-(ChunkingWrapper / SERLObsWrapper) are reused from serl_launcher via
+(ChunkingWrapper / SERLObsWrapper) are reused from rl_launcher via
 rl_launcher.wrappers.
 
 Migrated wrappers:
@@ -29,12 +29,11 @@ import numpy as np
 import gymnasium as gym
 from scipy.spatial.transform import Rotation as R
 
-from franka_env.utils.transformations import (
+from openarm_env.utils.transformations import (
     construct_adjoint_matrix,
     construct_homogeneous_matrix,
 )
-from serl_launcher.wrappers.chunking import ChunkingWrapper
-from serl_launcher.wrappers.serl_obs_wrappers import SERLObsWrapper
+from rl_launcher.wrappers import ChunkingWrapper, SERLObsWrapper
 
 from openarm_env.envs.openarm_env import (
     apply_binary_gripper_logic,

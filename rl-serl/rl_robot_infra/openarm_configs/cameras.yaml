@@ -1,0 +1,32 @@
+# Camera configuration for OpenArm deployment.
+#
+# The head/top camera is intentionally declared as "usb" instead of binding the
+# robot to a specific implementation. The default backend uses OpenCV/V4L2.
+# On a new robot, prefer setting OPENARM_HEAD_CAMERA_DEVICE first; if needed,
+# replace device_id with a stable /dev/v4l/by-id path after hardware discovery.
+
+head:
+  type: usb
+  backend: opencv
+  device_id:
+  env_device_id: OPENARM_HEAD_CAMERA_DEVICE
+  width: 1280
+  height: 960
+  fps: 30
+  exposure: 150
+
+left:
+  type: realsense
+  serial: "150622074105"
+  width: 640
+  height: 480
+  fps: 30
+  enable_depth: false
+
+right:
+  type: realsense
+  serial: "236422072385"
+  width: 640
+  height: 480
+  fps: 30
+  enable_depth: false

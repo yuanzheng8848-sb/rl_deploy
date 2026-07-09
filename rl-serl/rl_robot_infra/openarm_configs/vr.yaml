@@ -1,0 +1,50 @@
+# udp communication with VR headset
+udp:
+  port:
+    host: 5015
+    vr: 4032
+  max_retries: 5
+  broadcast_msg: "Hello, devices!"
+
+
+# reset pose and tolerance
+reset:
+  # lift height to offset reset poses
+  lift_height: 0.12
+  poses:
+    left: 
+      position: {x: 0.27, y: 0.3, z: 0.1}
+      orientation: {x: 0.707106781, y: 0.0, z: 0.707106781, w: 0.0}
+    right: 
+      position: {x: 0.27, y: -0.3, z: 0.1}
+      orientation: {x: 0.707106781, y: 0.0, z: 0.707106781, w: 0.0}
+    chest: 
+      position: {x: 0.0, y: 0.0, z: 0.493}
+      orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+  tolerance:
+    # # jerking simulation
+    # translation: 0.04
+    # rotation: 0.2
+    # real
+    translation: 0.01
+    rotation: 0.1
+  time: 5.0
+  samples: 50
+
+# calibration between VR controller and wrist
+calib_data_path: ../config/calib
+
+# safety bounds
+# Todo: adjust these bounds according to environment
+bounding:
+  translation:
+    min: [-1.0, -1.0, -1.0]
+    max: [1.0, 1.0, 1.0]
+  orientation:
+    reference: [3.141592654, -1.570796327, 0.0]
+    range: 3.0
+
+# gripper
+gripper_command_limit:
+  open: 1.0
+  close: 0.0
