@@ -16,8 +16,8 @@ import tqdm
 from absl import app, flags
 from flax.training import checkpoints
 
-from rl_launcher.agents import make_sac_pixel_agent_hybrid_dual_arm, make_wandb_logger
 from rl_launcher.data import MemoryEfficientReplayBufferDataStore
+from rl_launcher.utils.launcher import make_sac_pixel_agent_hybrid_dual_arm, make_wandb_logger
 
 from bc_utils import load_demo_dir_into_buffer
 from experiments.artifacts import task_bc_checkpoint_dir, task_success_dir

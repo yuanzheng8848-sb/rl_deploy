@@ -1,0 +1,11 @@
+# Optional dependencies for non-default hardware/debug workflows.
+# Install from the rl-serl repository root only when needed:
+#   pip install -r requirements-optional.txt
+
+# RealSense cameras. USB cameras use opencv-python from requirements.txt and do
+# not need this package.
+pyrealsense2
+
+# URDF/ROS visualization helpers. Full ROS 2 launch support still requires ROS
+# packages from apt, such as launch, launch_ros, and ament_index_python.
+xacro

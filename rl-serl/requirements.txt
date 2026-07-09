@@ -1,0 +1,69 @@
+# Install from the rl-serl repository root:
+#   pip install -r requirements.txt
+#
+# Version policy:
+# - RL stack versions follow hil-serl/serl_launcher/requirements.txt because the
+#   migrated agents, buffers, wrappers, and training loops come from that stack.
+# - Hardware/runtime libraries are added from rl-serl imports.
+# - JAX GPU wheels depend on the target Linux CUDA driver. For NVIDIA CUDA 12,
+#   install the matching JAX wheel before or after this file, for example:
+#     pip install -U "jax[cuda12]"
+
+-e ./rl_launcher
+-e ./rl_robot_infra
+
+# Core RL / network stack inherited from hil-serl.
+numpy>=1.24.3
+flax>=0.8.0
+distrax>=0.1.2
+ml_collections>=0.1.0
+tqdm>=4.60.0
+chex>=0.1.85
+optax>=0.1.5
+absl-py>=0.12.0
+scipy==1.11.4
+wandb>=0.12.14
+tensorflow>=2.15.0
+tensorflow_probability>=0.23.0
+tf-keras
+einops>=0.6.1
+imageio>=2.31.1
+moviepy>=1.0.3
+gym>=0.26
+gymnasium==0.29.1
+
+# JAX is intentionally not pinned to an exact wheel because CUDA support is
+# machine-specific. Keep the version compatible with flax>=0.8.0.
+jax>=0.4.20
+jaxlib>=0.4.20
+
+# Training/evaluation scripts.
+matplotlib
+seaborn
+pandas
+natsort
+pynput
+opencv-python
+requests
+PyYAML
+flask
+cloudpickle
+lz4
+pyzmq
+typing_extensions
+
+# OpenArm IK / visualization utilities migrated with the control stack.
+# jaxls is normally installed from GitHub; keep this line explicit so a fresh
+# Linux install can reproduce the current IK dependencies.
+jaxlie>=1.0.0
+jax_dataclasses>=1.0.0
+jaxtyping
+jaxls @ git+https://github.com/brentyi/jaxls.git
+pyroki @ git+https://github.com/chungmin99/pyroki.git
+viser
+yourdfpy
+loguru
+
+# Native CAN binding migrated under third_party/openarm_can. This requires Linux
+# build tools plus SocketCAN system setup; see docs/OPENARM_CAN_MIGRATION.md.
+-e ./third_party/openarm_can/python

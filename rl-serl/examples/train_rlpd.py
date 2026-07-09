@@ -68,7 +68,7 @@ except Exception:  # pragma: no cover - optional desktop dependency
 import jax
 import jax.numpy as jnp
 
-from rl_launcher.agents import (
+from rl_launcher.utils.launcher import (
     make_sac_pixel_agent_hybrid_dual_arm,
     make_trainer_config,
     make_wandb_logger,

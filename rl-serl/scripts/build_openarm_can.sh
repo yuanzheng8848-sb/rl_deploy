@@ -6,7 +6,7 @@ RL_SERL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OPENARM_CAN_ROOT="${RL_SERL_ROOT}/third_party/openarm_can"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "openarm_can must be built inside Linux/WSL because it uses SocketCAN."
+  echo "openarm_can must be built on Linux because it uses SocketCAN."
   exit 1
 fi
 

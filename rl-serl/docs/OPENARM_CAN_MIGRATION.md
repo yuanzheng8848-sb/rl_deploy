@@ -12,9 +12,9 @@ The Python controller reads CAN settings from:
 rl-serl/rl_robot_infra/openarm_configs/can.yaml
 ```
 
-## WSL Deployment Order
+## Linux Deployment Order
 
-1. Attach the USB-CAN devices to WSL and confirm Linux can see them.
+1. Attach the USB-CAN devices and confirm Linux can see them.
 
 ```bash
 lsusb
@@ -22,7 +22,7 @@ ls /dev/ttyACM*
 ip link
 ```
 
-2. Install native build tools inside WSL.
+2. Install native build tools on Linux.
 
 ```bash
 sudo apt update
@@ -54,7 +54,7 @@ sudo ip link set can0 up
 sudo ip link set can1 up
 ```
 
-5. Update `openarm_configs/can.yaml` if WSL enumerates left/right differently.
+5. Update `openarm_configs/can.yaml` if Linux enumerates left/right differently.
 
 6. Run import and bus checks before launching the full control server.
 

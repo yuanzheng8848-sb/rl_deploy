@@ -103,7 +103,7 @@ class BaseIKSolver:
 
         if self._track_chest:
             self._target_link_names.append(cfg_chest["link_name"])
-        # 每一�?target 都是 7 维， x y z qx qy qz qw
+        # 每一?target 都是 7 维， x y z qx qy qz qw
         self._target_pose_desired_shape = (len(self._target_link_names), 7)
         self._target_link_idxs = jnp.array(
             [self._robot.links.names.index(name) for name in self._target_link_names]

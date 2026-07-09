@@ -18,8 +18,8 @@ try:
 except Exception:  # pragma: no cover - optional desktop dependency
     keyboard = None
 
-from rl_launcher.agents import make_sac_pixel_agent_hybrid_dual_arm
 from rl_launcher.networks import load_classifier_func
+from rl_launcher.utils.launcher import make_sac_pixel_agent_hybrid_dual_arm
 
 from bc_utils import action_vector
 from experiments.artifacts import task_bc_checkpoint_dir, task_bc_eval_dir

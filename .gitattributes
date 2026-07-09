@@ -1,0 +1,14 @@
+# Normalize text files to LF so the repository behaves like a Linux checkout
+# across Windows and Linux clients.
+* text=auto eol=lf
+
+# Binary assets.
+*.dae text eol=lf
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.obj text eol=lf
+*.pdf binary
+*.png binary
+*.stl binary
+*.zip binary

@@ -19,7 +19,7 @@ from absl import app, flags
 from flax.training import checkpoints
 from matplotlib.backends.backend_pdf import PdfPages
 
-from rl_launcher.agents import make_sac_pixel_agent_hybrid_dual_arm
+from rl_launcher.utils.launcher import make_sac_pixel_agent_hybrid_dual_arm
 
 from bc_utils import (
     continuous_action,
