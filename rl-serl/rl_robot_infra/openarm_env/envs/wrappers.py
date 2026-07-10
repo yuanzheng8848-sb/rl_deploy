@@ -9,7 +9,7 @@ Migrated wrappers:
   - Quat2EulerWrapper            : tcp_pose quaternion -> euler
   - NetworkPrimaryImageCropWrapper : center-crop image_primary for policy stream
   - GripperPenaltyWrapper        : HIL-SERL learned-gripper penalty
-  - DualSpacemouseIntervention   : bimanual evdev teleop + /servo bridge
+  - DualSpacemouseIntervention   : bimanual evdev teleop + /control bridge
 
 Intentionally NOT migrated (removed features):
   - ArmFocusWrapper / arm_focus_*   (single-arm focus scaffolding)
@@ -334,7 +334,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
     and intervention transitions carry reward 0 (reward is supplied by the outer
     MultiCameraBinaryRewardClassifierWrapper). Requires the base env to expose
     refresh_obs() / currpos / gripper_binary_state / session / url and the flask
-    server's /servo/* routes.
+    server's /control/* routes.
     """
 
     def __init__(
@@ -608,7 +608,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             "gripper_step": self.servo_gripper_step,
             "backend": self.servo_backend,
         }
-        resp = self._post_server_json("/servo/start", payload, timeout=3.0)
+        resp = self._post_server_json("/control/start", payload, timeout=3.0)
         resp.raise_for_status()
         self._servo_running = True
 
@@ -616,7 +616,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         if not self._servo_running:
             return
         try:
-            self._post_server_json("/servo/stop", {}, timeout=2.0)
+            self._post_server_json("/control/stop", {}, timeout=2.0)
         except Exception:
             pass
         self._servo_running = False
@@ -650,7 +650,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             "arr": np.asarray(self._target_pose_ref, dtype=np.float32).tolist(),
             "gripper": base_env.gripper_actions_to_commands(action),
         }
-        resp = self._post_server_json("/servo/target", payload, timeout=2.0)
+        resp = self._post_server_json("/control/target", payload, timeout=2.0)
         resp.raise_for_status()
 
     def _sample_env_like_step(self, action):

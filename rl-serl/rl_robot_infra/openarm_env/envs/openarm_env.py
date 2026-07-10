@@ -389,7 +389,7 @@ class OpenArmEnv(gym.Env):
         """Ask the server to move the robot to the home joint pose."""
         try:
             # Server blocks for 10s, so we need a timeout > 10s
-            self.session.post(self.url + "jointreset", timeout=5)
+            self.session.post(self.url + "control/home", json={"duration": 3.0}, timeout=6)
             time.sleep(1) # Extra buffer
         except requests.exceptions.RequestException as e:
             print(f"[Env Warning] Joint reset failed: {e}")
@@ -400,20 +400,15 @@ class OpenArmEnv(gym.Env):
         arr = pos.astype(np.float32)
         data = {"arr": arr.tolist()} # 转换为嵌套列?
         
-        # Calculate duration for smooth blocking movement
-        # Ensure it matches the control frequency
-        duration = 1.0 / self.hz
-        data["duration"] = duration
-        
         if gripper_pos is not None:
             data["gripper"] = [float(x) for x in gripper_pos]
             
         try:
-            resp = self.session.post(self.url + "pose", json=data, timeout=5.0)
+            resp = self.session.post(self.url + "control/target", json=data, timeout=2.0)
             if resp.status_code != 200:
-                print(f"[Env Error] Pose command failed: {resp.text}")
+                print(f"[Env Error] Control target failed: {resp.text}")
         except requests.exceptions.RequestException as e:
-            print(f"[Env Error] Pose request failed: {e}")
+            print(f"[Env Error] Control target request failed: {e}")
 
     def refresh_obs(self) -> dict:
         """Refresh state from server without issuing a new motion command."""
@@ -423,7 +418,7 @@ class OpenArmEnv(gym.Env):
     def _update_currpos(self):
         """从服务器获取最新状态并更新内部变量"""
         try:
-            resp = self.session.post(self.url + "getstate", timeout=5.0)
+            resp = self.session.post(self.url + "state", timeout=3.0)
             ps = resp.json()
             
             # 辅助函数: 确保数据形状?(2, cols)

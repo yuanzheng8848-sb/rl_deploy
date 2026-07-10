@@ -2,6 +2,8 @@
 import numpy as np
 import time
 
+from openarm_control.types import ArmState, RobotState
+
 class MockOpenArmController:
     """
     Mock controller that simulates the interface of OpenArmController.
@@ -18,6 +20,10 @@ class MockOpenArmController:
         
         self.left_gripper = 0.0
         self.right_gripper = 0.0
+        self.left_dq = np.zeros(7)
+        self.right_dq = np.zeros(7)
+        self.last_ts = time.time()
+        self.last_state = RobotState.zeros()
         
         # Simulating hardware delay
         self.left_arm = "MockLeftArmHandle"
@@ -32,6 +38,70 @@ class MockOpenArmController:
     def get_right_position(self):
         noise = 0
         return self.right_q + noise, [self.right_gripper]
+
+    def _arm_state(self, q, dq, gripper):
+        now = time.time()
+        return ArmState(
+            q=np.asarray(q, dtype=float).copy(),
+            dq=np.asarray(dq, dtype=float).copy(),
+            tau=np.zeros(7),
+            t_mos=np.ones(7) * 30.0,
+            t_rotor=np.ones(7) * 30.0,
+            enabled=np.ones(7, dtype=bool),
+            gripper_q=np.array([float(gripper)]),
+            gripper_dq=np.zeros(1),
+            gripper_tau=np.zeros(1),
+            gripper_t_mos=np.ones(1) * 30.0,
+            gripper_t_rotor=np.ones(1) * 30.0,
+            gripper_enabled=np.ones(1, dtype=bool),
+            timestamp=now,
+        )
+
+    def read_state(self):
+        now = time.time()
+        state = RobotState(
+            left=self._arm_state(self.left_q, self.left_dq, self.left_gripper),
+            right=self._arm_state(self.right_q, self.right_dq, self.right_gripper),
+            timestamp=now,
+        )
+        state.joint_accel_est = np.zeros(14)
+        self.last_state = state
+        return state
+
+    def command_joint_target(self, q_target, gripper_target=None, active_arms=(0, 1), dt=0.0125, source="mock"):
+        q_target = np.asarray(q_target, dtype=float).reshape(14)
+        dt = max(float(dt), 1e-4)
+        if gripper_target is None:
+            gripper_target = [self.left_gripper, self.right_gripper]
+        if 0 in active_arms:
+            self.left_dq = (q_target[:7] - self.left_q) / dt
+            self.left_q = q_target[:7].copy()
+            self.left_gripper = float(gripper_target[0])
+        if 1 in active_arms:
+            self.right_dq = (q_target[7:] - self.right_q) / dt
+            self.right_q = q_target[7:].copy()
+            self.right_gripper = float(gripper_target[1])
+        return True, {"safety": {"mode": "NORMAL", "ok_to_send": True, "speed_scale": 1.0, "reasons": []}}
+
+    def set_target(self, q=None, gripper=None, active_arms=(0, 1), source="mock"):
+        self._target = (q, gripper, active_arms, source)
+        return self._target
+
+    def consume_latest_target(self):
+        return None
+
+    def hold_position(self):
+        pass
+
+    def diagnostics(self):
+        return {
+            "state": self.read_state().to_dict(),
+            "safety": {"mode": "NORMAL", "ok_to_send": True, "speed_scale": 1.0, "reasons": []},
+            "controller": {"mock": True},
+        }
+
+    def query_motor_params(self):
+        return {"left": {}, "right": {}}
 
     def set_left_position(self, target_joints, target_gripper, current_joints, current_gripper):
         # In simulation, we just instantly update the "state" to the target

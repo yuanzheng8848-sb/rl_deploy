@@ -18,25 +18,25 @@ import yaml
 
 from openarm_env.camera.camera_factory import build_camera, camera_frame
 
-# --- 配置 ---
+# --- 閰嶇疆 ---
 USE_MOCK = False  # Set to True to use Mock Hardware, False for Real Hardware
 
-# --- 路径配置 ---
-# 该文件位?rl-serl/rl_robot_infra/robot_servers/openarm_server.py
+# --- 璺緞閰嶇疆 ---
+# 璇ユ枃浠朵綅?rl-serl/rl_robot_infra/robot_servers/openarm_server.py
 # OpenArm control, IK, camera, configs, and description now live under rl_robot_infra.
 # parents: [0]=robot_servers [1]=rl_robot_infra [2]=rl-serl [3]=zy
 INFRA_ROOT = Path(__file__).resolve().parents[1]
 
-# --- 导入路径 ---
+# --- 瀵煎叆璺緞 ---
 
-# --- 导入控制?---
+# --- 瀵煎叆鎺у埗?---
 if USE_MOCK:
     print(">>> MODE: MOCK HARDWARE <<<")
     from openarm_env.mock_hardware import MockOpenArmController as HardwareController
 else:
     print(">>> MODE: REAL HARDWARE <<<")
     try:
-        from openarm_control.openarm_controller_2 import OpenArmController as HardwareController
+        from openarm_control.controller import OpenArmController as HardwareController
     except ImportError as e:
         print(f"[Server Error] Cannot import OpenArmController: {e}")
         print("Falling back to Mock Hardware due to import error.")
@@ -60,16 +60,16 @@ app = Flask(__name__)
 class OpenArmServer:
     def __init__(self):
         print(f"Initializing {'Mock' if USE_MOCK else 'Real'} OpenArm Hardware Controller...")
-        # 1. 初始化硬件控制器 (双臂)
+        # 1. 鍒濆鍖栫‖浠舵帶鍒跺櫒 (鍙岃噦)
         self.controller = HardwareController(enable_left=True, enable_right=True)
         
-        # 2. 初始?IK 求解??Viser
+        # 2. 鍒濆?IK 姹傝В??Viser
         self.ik_solver = None
         self.viser = None
         if IK_AVAILABLE:
             self._init_ik_and_viser()
 
-        # 用于线程安全的锁 (虽然 Flask 是多线程的，?CAN 通讯通常不是线程安全?
+        # 鐢ㄤ簬绾跨▼瀹夊叏鐨勯攣 (铏界劧 Flask 鏄绾跨▼鐨勶紝?CAN 閫氳閫氬父涓嶆槸绾跨▼瀹夊叏?
         self.lock = threading.Lock()
         self.camera_lock = threading.Lock()
         self.servo_lock = threading.Lock()
@@ -125,15 +125,15 @@ class OpenArmServer:
             with open(cfg_path / "solver.yaml") as f: s_cfg = yaml.safe_load(f)
             with open(cfg_path / "viser.yaml") as f: v_cfg = yaml.safe_load(f)
             
-            # 修正 URDF 路径指向
+            # 淇 URDF 璺緞鎸囧悜
             r_cfg["description"]["package_path"] = str(INFRA_ROOT)
             
             self.ik_solver = BaseIKSolver(s_cfg, r_cfg, visualize_collision=False)
             
-            # JAX Warmup (预编?IK 计算?
+            # JAX Warmup (棰勭紪?IK 璁＄畻?
             print("Warming up JAX IK Solver...")
             dummy_q = np.zeros(14)
-            # 这里?target 格式取决于求解器，假设为 [w, x, y, z, px, py, pz]
+            # 杩欓噷?target 鏍煎紡鍙栧喅浜庢眰瑙ｅ櫒锛屽亣璁句负 [w, x, y, z, px, py, pz]
             dummy_target = np.array([
                 [1,0,0,0, 0.3, 0.2, 0.3], 
                 [1,0,0,0, 0.3, -0.2, 0.3]
@@ -141,7 +141,7 @@ class OpenArmServer:
             self.ik_solver.solve_ik(dummy_target, dummy_q)
             print("IK Solver Ready.")
 
-            # 初始?Viser
+            # 鍒濆?Viser
             if ViserBase:
                 print("Initializing Viser...")
                 v_cfg["nb_vis_frames"] = 6
@@ -242,6 +242,9 @@ class OpenArmServer:
 
     def _get_current_joint_and_gripper(self):
         with self.lock:
+            if hasattr(self.controller, "read_state"):
+                state = self.controller.read_state()
+                return state.q.copy(), state.gripper_q.copy()
             q_l_curr, g_l_curr = self.controller.get_left_position()
             q_r_curr, g_r_curr = self.controller.get_right_position()
 
@@ -518,10 +521,34 @@ class OpenArmServer:
                 continue
 
             with self.lock:
-                if 0 in active_arms:
-                    self.controller.set_left_position(q_target[:7], float(stepped_gripper[0]), q_curr[:7], float(g_curr[0]))
-                if 1 in active_arms:
-                    self.controller.set_right_position(q_target[7:], float(stepped_gripper[1]), q_curr[7:], float(g_curr[1]))
+                if hasattr(self.controller, "command_joint_target"):
+                    ok, command_info = self.controller.command_joint_target(
+                        q_target,
+                        gripper_target=stepped_gripper,
+                        active_arms=active_arms,
+                        dt=max(1.0 / self.servo_hz, 0.001),
+                        source=f"servo:{backend}",
+                    )
+                    if not ok:
+                        self._update_servo_debug(
+                            status="safety_blocked",
+                            error=str(command_info.get("safety", {})),
+                            backend=backend,
+                            active_arms=active_arms,
+                            target_pose=stepped_pose,
+                            current_pose=current_pose,
+                            q_target=q_target,
+                            current_gripper=g_curr,
+                            target_gripper=target_gripper,
+                            stepped_gripper=stepped_gripper,
+                        )
+                        self._maybe_log_servo_debug()
+                        continue
+                else:
+                    if 0 in active_arms:
+                        self.controller.set_left_position(q_target[:7], float(stepped_gripper[0]), q_curr[:7], float(g_curr[0]))
+                    if 1 in active_arms:
+                        self.controller.set_right_position(q_target[7:], float(stepped_gripper[1]), q_curr[7:], float(g_curr[1]))
             self._update_servo_debug(
                 status="command_sent",
                 backend=backend,
@@ -629,69 +656,118 @@ class OpenArmServer:
             self.servo_backend = "analytic"
         return True
 
-    def get_state(self):
+    def get_state(self, include_images=True):
         """Return robot state, including encoded images."""
+        rich_state = None
         with self.lock:
-            # 读取关节和夹爪状?
-            l_pos, l_grip = self.controller.get_left_position()
-            r_pos, r_grip = self.controller.get_right_position()
+            # 璇诲彇鍏宠妭鍜屽す鐖姸?
+            if hasattr(self.controller, "read_state"):
+                rich_state = self.controller.read_state()
+                l_pos = rich_state.left.q
+                r_pos = rich_state.right.q
+                l_grip = rich_state.left.gripper_q
+                r_grip = rich_state.right.gripper_q
+            else:
+                l_pos, l_grip = self.controller.get_left_position()
+                r_pos, r_grip = self.controller.get_right_position()
             
-        # 处理 None
+        # 澶勭悊 None
         if l_pos is None: l_pos = np.zeros(7)
         if r_pos is None: r_pos = np.zeros(7)
         if not l_grip: l_grip = [0.0]
         if not r_grip: r_grip = [0.0]
         
-        # 拼接关节数据 (14?
+        # 鎷兼帴鍏宠妭鏁版嵁 (14?
         q = np.concatenate([l_pos, r_pos])
         
-        # 拼接夹爪数据 (2?
+        # 鎷兼帴澶圭埅鏁版嵁 (2?
         gripper = np.array([l_grip[0], r_grip[0]])
 
-        # 计算末端位姿 (Forward Kinematics)
-        # 即使没有 IK 求解器，也尽量返回数据，?pose 将为 0
+        # 璁＄畻鏈浣嶅Э (Forward Kinematics)
+        # 鍗充娇娌℃湁 IK 姹傝В鍣紝涔熷敖閲忚繑鍥炴暟鎹紝?pose 灏嗕负 0
         pose = np.zeros(14)
         if self.ik_solver:
-            # IK Solver 通常返回: [w, qx, qy, qz, px, py, pz]
-            # Gym Env 通常期望: [px, py, pz, rx, ry, rz, rw] (OpenArmEnv logic)
+            # IK Solver 閫氬父杩斿洖: [w, qx, qy, qz, px, py, pz]
+            # Gym Env 閫氬父鏈熸湜: [px, py, pz, rx, ry, rz, rw] (OpenArmEnv logic)
             ik_poses = self.ik_solver.get_current_ee_pose(q)
             for i in range(2):
                 p = ik_poses[i]
-                # 转换格式: [w, x, y, z, x, y, z] -> [x, y, z, x, y, z, w]
+                # 杞崲鏍煎紡: [w, x, y, z, x, y, z] -> [x, y, z, x, y, z, w]
                 pose[i*7 : i*7+3] = p[4:7] # Pos
                 pose[i*7+3 : i*7+6] = p[1:4] # Rot (quat xyz)
                 pose[i*7+6] = p[0]         # Rot (quat w)
 
-        # 构造返回字?
-        # controller 2.0 暂时没有直接返回速度和力矩，这里?0 防止 Env 报错
+        if rich_state is not None:
+            state_dict = rich_state.to_dict()
+            dq = state_dict["dq"]
+            joint_torque = state_dict["joint_torque"]
+            joint_accel_est = state_dict["joint_accel_est"]
+            motor_temperature = state_dict["motor_temperature"]
+            motor_enabled = state_dict["motor_enabled"]
+        else:
+            dq = [0.0] * 14
+            joint_torque = [0.0] * 14
+            joint_accel_est = [0.0] * 14
+            motor_temperature = {"t_mos": [], "t_rotor": []}
+            motor_enabled = []
+        safety_status = (
+            self.controller.safety.last_status.to_dict()
+            if hasattr(self.controller, "safety")
+            else {"mode": "UNKNOWN", "ok_to_send": True, "speed_scale": 1.0, "reasons": []}
+        )
+
         response = {
             "pose": pose.tolist(),
             "q": q.tolist(),
             "gripper_pos": gripper.tolist(),
-            "vel": [0.0] * 12,     # 笛卡尔速度
-            "dq": [0.0] * 14,      # 关节速度
+            "vel": [0.0] * 12,     # 绗涘崱灏旈€熷害
+            "dq": dq,
             "force": [0.0] * 6,
             "torque": [0.0] * 6,
+            "joint_torque": joint_torque,
+            "joint_accel_est": joint_accel_est,
+            "motor_temperature": motor_temperature,
+            "motor_enabled": motor_enabled,
+            "safety_status": safety_status,
+            "servo_debug": self._jsonify_servo_debug(),
         }
         
-        # 更新可视?
+        # 鏇存柊鍙?
         if self.viser:
             self.viser.update_joints(q)
 
-        # 获取最新图像并编码
+        # 鑾峰彇鏈€鏂板浘鍍忓苟缂栫爜
         encoded_images = {}
-        with self.camera_lock:
-            for name, frame in self.latest_frames.items():
-                if frame is not None:
-                    try:
-                        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                        b64_str = base64.b64encode(buffer).decode('utf-8')
-                        encoded_images[name] = b64_str
-                    except Exception as e:
-                        print(f"[Server Error] Encode image {name} failed: {e}")
+        if include_images:
+            with self.camera_lock:
+                for name, frame in self.latest_frames.items():
+                    if frame is not None:
+                        try:
+                            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                            b64_str = base64.b64encode(buffer).decode('utf-8')
+                            encoded_images[name] = b64_str
+                        except Exception as e:
+                            print(f"[Server Error] Encode image {name} failed: {e}")
 
         response["images"] = encoded_images
         return response
+
+    def _jsonify_servo_debug(self):
+        with self.servo_lock:
+            dbg = dict(self.servo_debug)
+        result = {}
+        for key, value in dbg.items():
+            if isinstance(value, np.ndarray):
+                result[key] = value.tolist()
+            elif isinstance(value, tuple):
+                result[key] = list(value)
+            else:
+                result[key] = value
+        if hasattr(self.controller, "diagnostics"):
+            diagnostics = self.controller.diagnostics()
+            result["controller"] = diagnostics.get("controller", {})
+            result["safety"] = diagnostics.get("safety", {})
+        return result
 
     def move_ik(self, target_pose_flat, duration=1, gripper_pos=None):
         """Move in Cartesian space by solving IK, then commanding joints."""
@@ -699,7 +775,7 @@ class OpenArmServer:
             print("[Server] Cannot move_ik: No solver initialized.")
             return False
 
-        # 1. 获取当前关节角作?IK 迭代初?
+        # 1. 鑾峰彇褰撳墠鍏宠妭瑙掍綔?IK 杩唬鍒?
         with self.lock:
             q_l_curr, _ = self.controller.get_left_position()
             q_r_curr, _ = self.controller.get_right_position()
@@ -708,9 +784,9 @@ class OpenArmServer:
         if q_r_curr is None: q_r_curr = np.zeros(7)
         q_curr = np.concatenate([q_l_curr, q_r_curr])
 
-        # 2. 转换目标格式 (Env -> IK Solver)
+        # 2. 杞崲鐩爣鏍煎紡 (Env -> IK Solver)
         # Env input: [px, py, pz, qx, qy, qz, qw]
-        # IK expects: [w, qx, qy, qz, px, py, pz] (假设 robot_ik_solver 遵循此约?
+        # IK expects: [w, qx, qy, qz, px, py, pz] (鍋囪 robot_ik_solver 閬靛惊姝ょ害?
         target_pose_input = np.array(target_pose_flat).reshape(2, 7)
         target_ik = np.zeros((2, 7))
         
@@ -722,14 +798,14 @@ class OpenArmServer:
             target_ik[i, 1:4] = quat[0:3] # x, y, z
             target_ik[i, 4:7] = pos     # px, py, pz
 
-        # 3. 求解 IK
+        # 3. 姹傝В IK
         q_target = self.ik_solver.solve_ik(target_ik, q_curr)
         
         if q_target is None or np.any(np.isnan(q_target)):
             print("[Server] IK Solution Failed (NaN or None)")
             return False
 
-        # 4. 执行关节移动 (平滑)
+        # 4. 鎵ц鍏宠妭绉诲姩 (骞虫粦)
         return self.move_joints(q_target, duration=duration, gripper_pos=gripper_pos)
 
     def move_joints(self, joints, duration=3, gripper_pos=None):
@@ -843,22 +919,54 @@ class OpenArmServer:
 
 
 
-# --- 实例?Server ---
+# --- 瀹炰緥?Server ---
 server = OpenArmServer()
 
-# --- Flask 路由定义 ---
+# --- Flask 璺敱瀹氫箟 ---
 
 @app.route("/getstate", methods=["POST"])
 def route_get_state():
     try:
-        return jsonify(server.get_state())
+        return jsonify(server.get_state(include_images=True))
     except Exception as e:
         print(f"[API Error] getstate: {e}")
         return str(e), 500
 
+
+@app.route("/state", methods=["POST"])
+def route_state():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(server.get_state(include_images=bool(payload.get("include_images", False))))
+    except Exception as e:
+        print(f"[API Error] state: {e}")
+        return str(e), 500
+
+
+@app.route("/diagnostics", methods=["POST"])
+def route_diagnostics():
+    try:
+        diagnostics = server.controller.diagnostics() if hasattr(server.controller, "diagnostics") else {}
+        diagnostics["servo_debug"] = server._jsonify_servo_debug()
+        return jsonify(diagnostics)
+    except Exception as e:
+        print(f"[API Error] diagnostics: {e}")
+        return str(e), 500
+
+
+@app.route("/motor_params/query", methods=["POST"])
+def route_motor_params_query():
+    try:
+        if hasattr(server.controller, "query_motor_params"):
+            return jsonify(server.controller.query_motor_params())
+        return jsonify({})
+    except Exception as e:
+        print(f"[API Error] motor_params/query: {e}")
+        return str(e), 500
+
 @app.route("/pose", methods=["POST"])
 def route_pose():
-    """接收笛卡尔位姿指?-> IK -> 关节控制"""
+    """鎺ユ敹绗涘崱灏斾綅濮挎寚?-> IK -> 鍏宠妭鎺у埗"""
     try:
         arr = request.json.get("arr")
         gripper = request.json.get("gripper") # Optional: [left, right]
@@ -876,7 +984,7 @@ def route_pose():
 
 @app.route("/move_joints", methods=["POST"])
 def route_move_joints():
-    """直接接收关节角度指令"""
+    """鐩存帴鎺ユ敹鍏宠妭瑙掑害鎸囦护"""
     try:
         joints = request.json.get("joints")
         gripper = request.json.get("gripper") # Optional: [left, right]
@@ -920,6 +1028,35 @@ def route_servo_start():
         return str(e), 500
 
 
+@app.route("/control/start", methods=["POST"])
+def route_control_start():
+    try:
+        payload = request.json or {}
+        arr = payload.get("arr")
+        gripper = payload.get("gripper")
+        servo_hz = payload.get("servo_hz", 100.0)
+        trans_step = payload.get("trans_step", 0.004)
+        rot_step = payload.get("rot_step", 0.012)
+        gripper_step = payload.get("gripper_step", 0.05)
+        arm = payload.get("arm", "both")
+        backend = payload.get("backend", "analytic")
+        if server.start_servo(
+            arr,
+            gripper_pos=gripper,
+            servo_hz=servo_hz,
+            trans_step=trans_step,
+            rot_step=rot_step,
+            gripper_step=gripper_step,
+            arm=arm,
+            backend=backend,
+        ):
+            return jsonify({"ok": True}), 200
+        return jsonify({"ok": False, "error": "control start failed"}), 500
+    except Exception as e:
+        print(f"[API Error] control/start: {e}")
+        return str(e), 500
+
+
 @app.route("/servo/target", methods=["POST"])
 def route_servo_target():
     try:
@@ -936,6 +1073,38 @@ def route_servo_target():
         return str(e), 500
 
 
+@app.route("/control/target", methods=["POST"])
+def route_control_target():
+    try:
+        payload = request.json or {}
+        arr = payload.get("arr")
+        joints = payload.get("joints")
+        gripper = payload.get("gripper")
+        if joints is not None:
+            q_target = np.array(joints, dtype=np.float64).reshape(14)
+            active_arms = (0, 1)
+            with server.lock:
+                ok, info = server.controller.command_joint_target(
+                    q_target,
+                    gripper_target=gripper,
+                    active_arms=active_arms,
+                    dt=max(1.0 / server.servo_hz, 0.001),
+                    source="control:joint_target",
+                )
+            return jsonify({"ok": bool(ok), "info": info}), 200 if ok else 409
+        if arr is None:
+            return "Missing array", 400
+        if not server.servo_enabled:
+            if not server.start_servo(arr, gripper_pos=gripper):
+                return "Servo Start Fail", 500
+        if server.update_servo_target(arr, gripper_pos=gripper):
+            return jsonify({"ok": True}), 200
+        return "Servo Not Enabled", 409
+    except Exception as e:
+        print(f"[API Error] control/target: {e}")
+        return str(e), 500
+
+
 @app.route("/servo/stop", methods=["POST"])
 def route_servo_stop():
     try:
@@ -946,14 +1115,43 @@ def route_servo_stop():
         return str(e), 500
 
 
+@app.route("/control/stop", methods=["POST"])
+def route_control_stop():
+    try:
+        server.stop_servo()
+        if hasattr(server.controller, "hold_position"):
+            with server.lock:
+                server.controller.hold_position()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        print(f"[API Error] control/stop: {e}")
+        return str(e), 500
+
+
+@app.route("/control/home", methods=["POST"])
+def route_control_home():
+    try:
+        home_pos_l = [-0.166811, -0.497863, 0.635447, 1.499999, -0.627859, 0.507960, -0.168161]
+        home_pos_r = [0.166811, 0.497863, -0.635447, 1.499999, 0.627859, -0.507960, 0.168161]
+        home_pos = np.concatenate([home_pos_l, home_pos_r])
+        payload = request.json or {}
+        duration = float(payload.get("duration", 3.0))
+        gripper = payload.get("gripper")
+        ok = server.move_joints(home_pos, duration=duration, gripper_pos=gripper)
+        return jsonify({"ok": bool(ok)}), 200 if ok else 409
+    except Exception as e:
+        print(f"[API Error] control/home: {e}")
+        return str(e), 500
+
+
 
 @app.route("/jointreset", methods=["POST"])
 def route_reset():
     """Move the robot to the configured home pose at episode boundaries."""
     try:
-        # 定义一个安全的 Home 位置 (弧度)
-        # 这里?14维数组需要根据实际机器人?"Zero" 姿态调?
-        # 参?Controller 2.0 中的 target
+        # 瀹氫箟涓€涓畨鍏ㄧ殑 Home 浣嶇疆 (寮у害)
+        # 杩欓噷?14缁存暟缁勯渶瑕佹牴鎹疄闄呮満鍣ㄤ汉?"Zero" 濮挎€佽皟?
+        # 鍙?Controller 2.0 涓殑 target
         # Updated Home Position from openarm_controller_2.py
         # Left Arm (0-6)
         home_pos_l = [-0.166811, -0.497863 , 0.635447, 1.499999, -0.627859, 0.507960, -0.168161]
@@ -961,9 +1159,9 @@ def route_reset():
         home_pos_r = [0.166811, 0.497863, -0.635447, 1.499999, 0.627859, -0.507960, 0.168161]
         home_pos = np.concatenate([home_pos_l, home_pos_r])
         
-        # 使用 controller 自带的平滑移动更好，但那是阻塞的?
-        # 既然?Reset，阻塞一下也没关系?
-        # 或者直接调?move_joints (非平滑，直接 PID)
+        # 浣跨敤 controller 鑷甫鐨勫钩婊戠Щ鍔ㄦ洿濂斤紝浣嗛偅鏄樆濉炵殑?
+        # 鏃㈢劧?Reset锛岄樆濉炰竴涓嬩篃娌″叧绯?
+        # 鎴栬€呯洿鎺ヨ皟?move_joints (闈炲钩婊戯紝鐩存帴 PID)
         server.move_joints(home_pos, duration=3)
         
         return "OK", 200
@@ -972,7 +1170,7 @@ def route_reset():
         return str(e), 500
 
 if __name__ == "__main__":
-    # 启动 Flask 服务
-    # threaded=True 允许并发请求（虽?CAN 操作加了锁）
+    # 鍚姩 Flask 鏈嶅姟
+    # threaded=True 鍏佽骞跺彂璇锋眰锛堣櫧?CAN 鎿嶄綔鍔犱簡閿侊級
     print("Starting OpenArm Server on port 5000...")
     app.run(host="0.0.0.0", port=5000, threaded=True)
