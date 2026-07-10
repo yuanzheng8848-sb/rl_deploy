@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Record bimanual teleop demos in the training transition format (rl-serl).
 
-Migrated from rl_deploy/demo/record_demo.py. The only structural change is the
-environment source: instead of `train.create_env(...)`, demos are collected with
-the task config's get_environment(fake_env=False, classifier=False), which
-includes the DualSpacemouseIntervention wrapper. ENTER/SPACE label trajectories
-as success/failure; ESC quits.
+Demos are collected with the task config's
+get_environment(env_mode="real", classifier=False), which
+includes the DualSpacemouseIntervention wrapper. ENTER/SPACE save trajectories
+into success/failure directories for classifier dataset construction; they do
+not write rewards.
 """
-import compat  # noqa: F401  (sys.path + CUDA/JAX patches; must be first)
+import project_paths  # noqa: F401  (sets local package paths; must be first)
 
 import argparse
 import copy
@@ -192,7 +192,7 @@ def save_trajectory(target_dir: Path, raw_target_dir: Path, trajectory, raw_fram
     return file_path
 
 
-def finalize_trajectory(trajectory, success: bool):
+def finalize_trajectory(trajectory):
     if not trajectory:
         return trajectory
     finalized = [copy.deepcopy(transition) for transition in trajectory]
@@ -200,9 +200,7 @@ def finalize_trajectory(trajectory, success: bool):
         transition["rewards"] = np.asarray(0.0, dtype=np.float32)
         transition["masks"] = np.asarray(1.0, dtype=np.float32)
         transition["dones"] = False
-    finalized[-1]["rewards"] = np.asarray(1.0 if success else 0.0, dtype=np.float32)
-    finalized[-1]["masks"] = np.asarray(0.0, dtype=np.float32)
-    finalized[-1]["dones"] = True
+        transition["truncated"] = False
     return finalized
 
 
@@ -217,7 +215,7 @@ def main():
     os.makedirs(dirs["raw_failure"], exist_ok=True)
 
     config = CONFIG_MAPPING[args.exp_name]()
-    env = config.get_environment(fake_env=False, classifier=False)
+    env = config.get_environment(env_mode="real", classifier=False)
     teleop_wrapper = find_wrapper(env, "DualSpacemouseIntervention")
     if teleop_wrapper is not None:
         teleop_wrapper.control_hz = float(args.teleop_control_hz)
@@ -260,7 +258,7 @@ def main():
                     print(f"[Recorder] trajectory too short ({len(current_trajectory)}), discarded.")
                 else:
                     success = label == "success"
-                    finalized = finalize_trajectory(current_trajectory, success=success)
+                    finalized = finalize_trajectory(current_trajectory)
                     save_trajectory(
                         dirs["success"] if success else dirs["failure"],
                         dirs["raw_success"] if success else dirs["raw_failure"],
@@ -289,6 +287,7 @@ def main():
                     "rewards": np.asarray(sampled_transition["rewards"], dtype=np.float32),
                     "masks": np.asarray(1.0 - float(sampled_transition["dones"]), dtype=np.float32),
                     "dones": bool(sampled_transition["dones"]),
+                    "truncated": bool(sampled_transition.get("truncated", False)),
                     "infos": copy.deepcopy(sampled_transition.get("infos", info)),
                 }
             elif "intervene_action" in info:
@@ -299,6 +298,7 @@ def main():
                     "rewards": np.asarray(reward, dtype=np.float32),
                     "masks": np.asarray(1.0 - float(done), dtype=np.float32),
                     "dones": bool(done),
+                    "truncated": bool(truncated),
                     "infos": copy.deepcopy(info),
                 }
             else:

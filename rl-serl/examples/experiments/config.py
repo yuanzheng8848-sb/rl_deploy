@@ -1,9 +1,5 @@
 """Default training configuration base class for rl-serl experiments.
 
-Mirrors hil-serl/examples/experiments/config.py (DefaultTrainingConfig). Each
-task defines a subclass under experiments/<task>/config.py implementing
-get_environment(). Defaults below carry over the values used by the original
-rl_deploy/train.py FLAGS so behavior is preserved.
 """
 import os
 from abc import abstractmethod
@@ -16,11 +12,10 @@ import jax.numpy as jnp
 class DefaultTrainingConfig:
     """Default training configuration."""
 
-    # Bimanual hybrid SAC (learned gripper, dual arm) — OpenArm is always bimanual.
+    # Bimanual hybrid SAC (learned gripper, dual arm). OpenArm is always bimanual.
     agent: str = "sac"
     setup_mode: str = "dual-arm-learned-gripper"
 
-    # carried over from rl_deploy/train.py FLAGS defaults
     max_traj_length: int = 400
     batch_size: int = 256
     discount: float = 0.97
@@ -92,7 +87,7 @@ class DefaultTrainingConfig:
             """
             sigmoid = lambda x: 1 / (1 + jnp.exp(-x))
             logits = clf(obs)
-            # Ensure scalar for int() conversion: (1, 1) or (1,) → scalar
+            # Ensure scalar for int() conversion: (1, 1) or (1,) -> scalar.
             if logits.ndim > 0:
                 logits = logits.squeeze()
             prob = sigmoid(logits)
@@ -101,5 +96,5 @@ class DefaultTrainingConfig:
         return reward_func
 
     @abstractmethod
-    def get_environment(self, fake_env=False, save_video=False, classifier=False):
+    def get_environment(self, env_mode="real", classifier=False):
         raise NotImplementedError

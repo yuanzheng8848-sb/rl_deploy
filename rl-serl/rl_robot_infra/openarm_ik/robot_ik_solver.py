@@ -77,7 +77,7 @@ class BaseIKSolver:
         
         # If path is relative and doesn't exist in CWD, try resolving relative to workspace root
         if not path_to_desc.is_absolute() and not path_to_desc.exists():
-            # Resolve relative package paths against the migrated rl_robot_infra tree.
+            # Resolve relative package paths against the rl_robot_infra tree.
             workspace_root = Path(__file__).resolve().parent.parent
             potential_path = workspace_root / path_to_desc
             if potential_path.exists():
@@ -103,7 +103,7 @@ class BaseIKSolver:
 
         if self._track_chest:
             self._target_link_names.append(cfg_chest["link_name"])
-        # 每一?target 都是 7 维， x y z qx qy qz qw
+        # Each target is 7-D: x y z qx qy qz qw.
         self._target_pose_desired_shape = (len(self._target_link_names), 7)
         self._target_link_idxs = jnp.array(
             [self._robot.links.names.index(name) for name in self._target_link_names]
@@ -395,4 +395,3 @@ if __name__ == "__main__":
     cfgs_solver = yaml.safe_load( (cfgs_path / "solver.yaml").read_text())
 
     solver = BaseIKSolver(cfgs_solver, cfgs_robot, False)
-

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Train an RLPD-compatible behavior cloning checkpoint for rl-serl."""
-import compat  # noqa: F401  (sys.path + CUDA/JAX patches; must be first)
+"""Train a behavior cloning checkpoint for rl-serl."""
+import project_paths  # noqa: F401  (sets local package paths; must be first)
 
 import csv
 import json
@@ -365,7 +365,7 @@ def main(_):
             indent=2,
         )
 
-    env = config.get_environment(fake_env=True, classifier=False)
+    env = config.get_environment(env_mode="virtual", classifier=False)
     agent = create_agent(config, env)
 
     buffer = MemoryEfficientReplayBufferDataStore(

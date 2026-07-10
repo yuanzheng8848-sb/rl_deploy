@@ -1,6 +1,5 @@
-"""Experiment registry — maps exp_name to its TrainConfig.
+"""Experiment registry mapping exp_name to its TrainConfig.
 
-Mirrors hil-serl/examples/experiments/mappings.py.
 """
 from experiments.openarm_pickplace.config import TrainConfig as OpenArmPickPlaceTrainConfig
 

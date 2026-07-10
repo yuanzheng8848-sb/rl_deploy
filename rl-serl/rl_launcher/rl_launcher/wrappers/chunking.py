@@ -42,6 +42,8 @@ class ChunkingWrapper(gym.Wrapper):
 
     def __init__(self, env: gym.Env, obs_horizon: int, act_exec_horizon: Optional[int]):
         super().__init__(env)
+        if obs_horizon != 1:
+            raise NotImplementedError("ChunkingWrapper currently supports obs_horizon=1 only")
         self.env = env
         self.obs_horizon = obs_horizon
         self.act_exec_horizon = act_exec_horizon

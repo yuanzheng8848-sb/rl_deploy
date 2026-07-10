@@ -257,7 +257,7 @@ def make_trainer_config(port_number: int = 5588, broadcast_port: int = 5589):
 
 
 def make_wandb_logger(
-    project: str = "hil-serl",
+    project: str = "rl-serl",
     description: str = "rl_launcher",
     debug: bool = False,
 ):

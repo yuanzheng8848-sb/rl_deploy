@@ -88,12 +88,7 @@ def _split_command(command: MITCommand, start: int, stop: int) -> MITCommand:
 
 
 class OpenArmController:
-    """High-level bimanual controller with a modern state and command API.
-
-    Legacy methods such as get_left_position() are preserved as a thin facade
-    for older server code, but the preferred path is read_state() +
-    command_joint_target().
-    """
+    """High-level bimanual controller with state and joint-command APIs."""
 
     def __init__(self, enable_left=True, enable_right=True, can_config_path=None, control_config_path=None):
         self.enable_left = bool(enable_left)
@@ -237,26 +232,3 @@ class OpenArmController:
             "safety": self.safety.last_status.to_dict(),
             "controller": dict(self.debug),
         }
-
-    # Legacy facade -----------------------------------------------------
-    def get_left_position(self):
-        state = self.read_state().left
-        return state.q.copy(), state.gripper_q.copy().tolist()
-
-    def get_right_position(self):
-        state = self.read_state().right
-        return state.q.copy(), state.gripper_q.copy().tolist()
-
-    def set_left_position(self, left_arm_position, left_gripper_position, current_arm_position=None, current_gripper_position=None):
-        q_target = self.last_state.q.copy()
-        q_target[:7] = np.asarray(left_arm_position, dtype=float)
-        gripper = self.last_state.gripper_q.copy()
-        gripper[0] = float(left_gripper_position)
-        return self.command_joint_target(q_target, gripper_target=gripper, active_arms=(0,), source="legacy_left")
-
-    def set_right_position(self, right_arm_position, right_gripper_position, current_arm_position=None, current_gripper_position=None):
-        q_target = self.last_state.q.copy()
-        q_target[7:] = np.asarray(right_arm_position, dtype=float)
-        gripper = self.last_state.gripper_q.copy()
-        gripper[1] = float(right_gripper_position)
-        return self.command_joint_target(q_target, gripper_target=gripper, active_arms=(1,), source="legacy_right")

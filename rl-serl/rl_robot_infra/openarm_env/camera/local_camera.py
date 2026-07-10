@@ -1,52 +1,68 @@
-"""Local camera setup for OpenArm RL deployment.
-
-The actual capture thread lives on LocalOpenArmEnv (envs/local_openarm_env.py),
-which owns self.cameras / self.latest_images; this module only centralizes the
-hardware constants and camera construction so they are reusable and testable.
-"""
-from pathlib import Path
-
-import yaml
+"""Local camera construction for OpenArm environments."""
 
 from openarm_env.camera.camera_factory import build_camera
 
 
 MODEL_IMAGE_SIZE = (128, 128)
-INFRA_ROOT = Path(__file__).resolve().parents[2]
-CAMERA_CONFIG_PATH = INFRA_ROOT / "openarm_configs" / "cameras.yaml"
 
-
-_IMAGE_KEYS = {
-    "head": "image_primary",
-    "left": "image_left",
-    "right": "image_right",
+_DEFAULT_CAMERA_CONFIGS = {
+    "local-head": {
+        "name": "head",
+        "type": "usb",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "env_device_id": "OPENARM_HEAD_CAMERA_DEVICE",
+    },
+    "local-left": {
+        "name": "left",
+        "type": "realsense",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+    },
+    "local-right": {
+        "name": "right",
+        "type": "realsense",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+    },
 }
 
 
-def load_camera_configs():
-    with open(CAMERA_CONFIG_PATH) as f:
-        return yaml.safe_load(f) or {}
+def resolve_camera_config(camera_ref):
+    if isinstance(camera_ref, dict):
+        cfg = dict(camera_ref)
+        cfg.setdefault("name", cfg.get("id", "camera"))
+        return cfg
+    if isinstance(camera_ref, str):
+        if camera_ref not in _DEFAULT_CAMERA_CONFIGS:
+            raise ValueError(f"Unknown camera ref {camera_ref!r}")
+        return dict(_DEFAULT_CAMERA_CONFIGS[camera_ref])
+    raise TypeError(f"Camera config must be a dict or known camera ref, got {camera_ref!r}")
 
 
-def build_cameras(fake_env=False):
-    """Construct the (key, camera) list used by LocalOpenArmEnv.
+def build_cameras(camera_config, virtual=False):
+    """Construct (image_key, camera) pairs from EnvConfig.REALSENSE_CAMERAS only."""
+    if not isinstance(camera_config, dict):
+        raise TypeError("camera_config must be a dict mapping image keys to camera configs")
 
-    Returns a list of (image_key, camera_obj). Any camera that fails to
-    initialize is skipped with a warning (matches original behavior).
-    """
     try:
         from openarm_env.mock_hardware import MockCamera
     except Exception:
         MockCamera = None
 
     cameras = []
-    for name, cfg in load_camera_configs().items():
-        try:
-            cam = build_camera(name, cfg, fake_env=fake_env, mock_camera_cls=MockCamera)
-            image_key = _IMAGE_KEYS.get(name, f"image_{name}")
-            cameras.append((image_key, cam))
-            print(f"Initialized {name} camera ({cfg.get('type')})")
-        except Exception as exc:
-            print(f"Failed to init {name} camera: {exc}")
-
+    seen = set()
+    for image_key, camera_ref in camera_config.items():
+        if image_key in seen:
+            raise ValueError(f"Duplicate image key {image_key!r}")
+        seen.add(image_key)
+        cfg = resolve_camera_config(camera_ref)
+        camera_name = cfg.get("name", image_key)
+        cam = build_camera(camera_name, cfg, virtual=virtual, mock_camera_cls=MockCamera)
+        cameras.append((image_key, cam))
+        mode = "virtual" if virtual else cfg.get("type")
+        print(f"Initialized {image_key} camera ({mode})")
     return cameras

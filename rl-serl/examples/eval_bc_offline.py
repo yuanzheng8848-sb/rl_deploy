@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Offline BC checkpoint evaluation against recorded demo transitions."""
-import compat  # noqa: F401  (sys.path + CUDA/JAX patches; must be first)
+import project_paths  # noqa: F401  (sets local package paths; must be first)
 
 import csv
 import json
@@ -812,7 +812,7 @@ def plot_step_action_trajectories(output_dir, traj_xyz):
         path_r = _stack_xyz(xyz_seq["path_right"])
 
         fig = plt.figure(figsize=(14, 6))
-        fig.suptitle(f"Eval vs Real End-Effector Trajectory — {name}  (MSE={mse:.4f})",
+        fig.suptitle(f"Eval vs Real End-Effector Trajectory - {name}  (MSE={mse:.4f})",
                      fontsize=14, fontweight="bold")
 
         ax1 = fig.add_subplot(1, 2, 1, projection="3d")
@@ -881,7 +881,7 @@ def plot_action_diagnostics(output_dir, traj_xyz):
 
         fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=False)
         fig.suptitle(
-            f"Per-frame Action XYZ — {name}",
+            f"Per-frame Action XYZ - {name}",
             fontsize=14,
             fontweight="bold",
         )
@@ -956,7 +956,7 @@ def plot_step_diagnostics(output_dir, traj_xyz):
 
         fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=False)
         fig.suptitle(
-            f"One-Step TCP Diagnostics — {name}  "
+            f"One-Step TCP Diagnostics - {name}  "
             f"(moving > {FLAGS.moving_step_threshold * 1000:.1f} mm)",
             fontsize=14,
             fontweight="bold",
@@ -1096,11 +1096,10 @@ def main(_):
     output_dir = Path(FLAGS.output_dir or default_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    env = config.get_environment(fake_env=True, classifier=False)
+    env = config.get_environment(env_mode="virtual", classifier=False)
     agent = restore_agent(create_agent(config, env), checkpoint_path)
     rng = jax.random.PRNGKey(FLAGS.seed)
 
-    # BC评估只使用success数据（BC训练也只用success数据）
     success_dir = os.path.abspath(FLAGS.success_dir or task_success_dir(FLAGS.exp_name))
     all_frame_rows, all_traj_rows, all_high_error, all_traj_xyz, rng = evaluate_split(
         agent, "success", success_dir, rng

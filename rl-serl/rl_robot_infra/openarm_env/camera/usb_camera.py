@@ -55,6 +55,9 @@ class USBCamera:
 
         return frame
 
-    def __del__(self):
+    def close(self):
         if hasattr(self, "cap") and self.cap.isOpened():
             self.cap.release()
+
+    def __del__(self):
+        self.close()

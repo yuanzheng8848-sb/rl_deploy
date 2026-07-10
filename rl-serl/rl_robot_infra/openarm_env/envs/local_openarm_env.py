@@ -1,12 +1,4 @@
-"""LocalOpenArmEnv: OpenArm env variant that reads cameras locally.
-
-Migrated from rl_deploy/train.py (LocalOpenArmEnv, lines ~211-328).
-
-Unlike OpenArmEnv (which receives images base64-encoded from the flask server),
-this variant runs its own background capture thread reading the three cameras
-directly on the client side (head USB + two wrist RealSense). It is used by the
-training/actor entrypoints so that image latency does not go through the server.
-"""
+"""LocalOpenArmEnv: OpenArm env variant that reads cameras locally."""
 import time
 import cv2
 import numpy as np
@@ -20,16 +12,10 @@ from openarm_env.camera.local_camera import (
 
 
 class LocalOpenArmEnv(OpenArmEnv):
-    """OpenArm env variant that always reads images locally, even in fake mode."""
+    """OpenArm env variant that reads real or virtual cameras locally."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if self.fake_env:
-            print("[LocalOpenArmEnv] forcing local camera init in fake mode.")
-            self.init_cameras(None)
-
-    def init_cameras(self, _config):
-        self.cameras = build_cameras(fake_env=self.fake_env)
+    def init_cameras(self, camera_config):
+        self.cameras = build_cameras(camera_config, virtual=self.is_virtual)
         self.latest_images_raw = {}
 
         self.stop_event = Event()
@@ -70,4 +56,12 @@ class LocalOpenArmEnv(OpenArmEnv):
             self.stop_event.set()
         if hasattr(self, "capture_thread"):
             self.capture_thread.join(timeout=1.0)
+        for _, camera in getattr(self, "cameras", []):
+            close = getattr(camera, "close", None)
+            if callable(close):
+                close()
+                continue
+            stop = getattr(camera, "stop", None)
+            if callable(stop):
+                stop()
         super().close()

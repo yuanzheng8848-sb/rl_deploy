@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run a BC checkpoint directly on the real OpenArm environment."""
-import compat  # noqa: F401  (sys.path + CUDA/JAX patches; must be first)
+import project_paths  # noqa: F401  (sets local package paths; must be first)
 
 import csv
 import os
@@ -13,10 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 from absl import app, flags
 from flax.training import checkpoints
-try:
-    from pynput import keyboard
-except Exception:  # pragma: no cover - optional desktop dependency
-    keyboard = None
 
 from rl_launcher.networks import load_classifier_func
 from rl_launcher.utils.launcher import make_sac_pixel_agent_hybrid_dual_arm
@@ -34,7 +30,6 @@ flags.DEFINE_integer("checkpoint_step", 0, "Checkpoint step, 0 means latest.")
 flags.DEFINE_integer("eval_n_trajs", 5, "Number of real rollouts.")
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_boolean("argmax", True, "Use deterministic action mode.")
-flags.DEFINE_boolean("save_video", False, "Pass save_video to task env.")
 flags.DEFINE_string("output_dir", None, "Defaults to task bc_eval/real.")
 flags.DEFINE_boolean("render", True, "Render camera images with classifier prob and reward.")
 flags.DEFINE_float("render_fps", 20.0, "Render refresh cap.")
@@ -79,45 +74,6 @@ def write_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=sorted(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-
-
-def make_keyboard_state():
-    return {"label": None, "quit_requested": False}
-
-
-def start_keyboard_listener(state):
-    if keyboard is None:
-        print_yellow("[BC Real Eval] pynput unavailable; keyboard labels require the OpenCV window focus.")
-        return None
-
-    def on_press(key):
-        try:
-            if key == keyboard.Key.enter:
-                state["label"] = "success"
-                print_green("[BC Real Eval] ENTER -> success requested")
-            elif key == keyboard.Key.space:
-                state["label"] = "failure"
-                print_yellow("[BC Real Eval] SPACE -> failure requested")
-            elif key == keyboard.Key.esc:
-                state["quit_requested"] = True
-                print_yellow("[BC Real Eval] ESC -> quit requested")
-        except Exception:
-            pass
-
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    return listener
-
-
-def consume_keyboard_label(state):
-    if state.get("quit_requested"):
-        state["quit_requested"] = False
-        return "quit"
-    label = state.get("label")
-    if label:
-        state["label"] = None
-        return label
-    return None
 
 
 def image_from_obs(obs, key):
@@ -171,16 +127,12 @@ def render_feedback(obs, image_keys, prob, threshold, reward, done, info):
         cv2.putText(panel, f"prob={prob:.3f}/{threshold:.2f}", (12, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(panel, f"reward={float(np.asarray(reward)):.1f}", (12, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
         cv2.putText(panel, f"done={bool(done)} succeed={bool(info.get('succeed', False))}", (12, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(panel, "ENTER=success  SPACE=failure  q=quit", (12, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(panel, "q=quit", (12, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1, cv2.LINE_AA)
         panels.append(panel)
     if panels:
         cv2.imshow("rl-serl BC real eval", np.concatenate(panels, axis=1))
     delay = max(1, int(1000 / max(float(FLAGS.render_fps), 1.0)))
     key = cv2.waitKey(delay) & 0xFF
-    if key in (10, 13):
-        return "success"
-    if key == ord(" "):
-        return "failure"
     if key in (27, ord("q")):
         return "quit"
     return None
@@ -196,11 +148,9 @@ def main(_):
     output_dir = Path(FLAGS.output_dir or (task_bc_eval_dir(FLAGS.exp_name) / "real"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    env = config.get_environment(fake_env=False, save_video=FLAGS.save_video, classifier=False)
+    env = config.get_environment(env_mode="real", classifier=True)
     agent = restore_agent(create_agent(config, env), checkpoint_path)
     classifier_prob_fn, classifier_threshold = make_classifier_prob(config, env)
-    keyboard_state = make_keyboard_state()
-    keyboard_listener = start_keyboard_listener(keyboard_state)
     rng = jax.random.PRNGKey(FLAGS.seed)
 
     episode_rows = []
@@ -231,7 +181,7 @@ def main(_):
                 next_obs, reward, done, truncated, info = env.step(action)
                 info = info if isinstance(info, dict) else {}
                 prob = classifier_prob_fn(next_obs) if classifier_prob_fn is not None else 0.0
-                cv2_label = render_feedback(
+                render_label = render_feedback(
                     next_obs,
                     config.image_keys,
                     prob,
@@ -240,26 +190,10 @@ def main(_):
                     bool(done or truncated),
                     info,
                 )
-                key_label = consume_keyboard_label(keyboard_state) or cv2_label
-                if key_label == "success":
-                    reward = np.asarray(1.0, dtype=np.float32)
-                    done = True
-                    truncated = False
-                    info["keyboard_label"] = "success"
-                    info["succeed"] = True
-                    print_green("[BC Real Eval] success reward=1, ending episode.")
-                elif key_label == "failure":
-                    reward = np.asarray(0.0, dtype=np.float32)
-                    done = True
-                    truncated = False
-                    info["keyboard_label"] = "failure"
-                    info["succeed"] = False
-                    print_yellow("[BC Real Eval] failure reward=0, ending episode.")
-                elif key_label == "quit":
+                if render_label == "quit":
                     done = True
                     truncated = True
                     quit_requested = True
-                    info["keyboard_label"] = "quit"
                 action_for_metrics = action_vector(action)
                 action_norm = float(np.linalg.norm(action_for_metrics))
                 action_norms.append(action_norm)
@@ -268,21 +202,20 @@ def main(_):
                     gripper_changes += 1
                 last_gripper = gripper
                 step_rows.append(
-                {
-                    "episode": episode_idx,
-                    "step": step,
-                    "reward": float(np.asarray(reward)),
-                    "done": int(done),
-                    "truncated": int(truncated),
-                    "classifier_prob": prob,
-                    "classifier_threshold": classifier_threshold,
-                    "classifier_reference_success": int(prob > classifier_threshold),
-                    "keyboard_label": info.get("keyboard_label", ""),
-                    "succeed": int(bool(info.get("succeed", False))),
-                    "action_norm": action_norm,
-                    "gripper_left": gripper[0],
-                    "gripper_right": gripper[1],
-                }
+                    {
+                        "episode": episode_idx,
+                        "step": step,
+                        "reward": float(np.asarray(reward)),
+                        "done": int(done),
+                        "truncated": int(truncated),
+                        "classifier_prob": prob,
+                        "classifier_threshold": classifier_threshold,
+                        "classifier_reference_success": int(prob > classifier_threshold),
+                        "succeed": int(bool(info.get("succeed", False))),
+                        "action_norm": action_norm,
+                        "gripper_left": gripper[0],
+                        "gripper_right": gripper[1],
+                    }
                 )
                 episode_return += float(np.asarray(reward))
                 obs = next_obs
@@ -306,8 +239,6 @@ def main(_):
                 f"[BC Real Eval] episode {episode_idx}: return={episode_return:.3f}, steps={step}"
             )
     finally:
-        if keyboard_listener is not None:
-            keyboard_listener.stop()
         env.close()
         if FLAGS.render:
             cv2.destroyAllWindows()

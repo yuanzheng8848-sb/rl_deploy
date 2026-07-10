@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """Train binary reward classifier for OpenArm (rl-serl).
 
-Migrated from rl_deploy/classifier/train_classifier.py. Key changes:
-  - IMAGE_KEY: "image_0" → "image_primary" (matches the policy stream key)
-  - Uses the already-cropped image_primary saved by record_demos, matching the
-    online classifier input from NetworkPrimaryImageCropWrapper
-  - Demo/checkpoint paths are scoped under examples/experiments/<exp_name>/
-  - Uses compat for sys.path injection
 
 Training data: positive samples from the last N frames of success trajectories,
 negative samples from the first M frames of success trajectories. N and M are
@@ -14,7 +8,7 @@ configured by the task config's classifier_success_tail_frames and
 classifier_failure_head_frames. This creates a temporal contrast "before success"
 vs "after success" that is easier to learn than "complete failure" vs "success".
 """
-import compat  # noqa: F401
+import project_paths  # noqa: F401
 
 import glob
 import os
@@ -40,7 +34,6 @@ from rl_launcher.vision import batched_random_crop
 
 from experiments.artifacts import (
     task_classifier_ckpt_dir,
-    task_failure_dir,
     task_success_dir,
 )
 from experiments.mappings import CONFIG_MAPPING
@@ -59,20 +52,9 @@ flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoint. Defaults 
 flags.DEFINE_integer("batch_size", 64, "Batch size")
 flags.DEFINE_integer("num_epochs", 100, "Number of epochs")
 flags.DEFINE_string(
-    "demo_dir",
-    None,
-    "Deprecated alias for --success_dir. Defaults to the task folder.",
-)
-flags.DEFINE_string(
     "success_dir",
     None,
     "Success pkl directory. Defaults to the task folder.",
-)
-flags.DEFINE_string(
-    "failure_dir",
-    None,
-    "Deprecated: negative samples now come from success trajectory head frames. "
-    "If provided, this directory is ignored.",
 )
 flags.DEFINE_string(
     "image_key",
@@ -99,7 +81,7 @@ def resolve_task_settings():
     checkpoint_path = FLAGS.checkpoint_path or getattr(
         config, "classifier_ckpt_path", str(task_classifier_ckpt_dir(FLAGS.exp_name))
     )
-    success_dir = FLAGS.success_dir or FLAGS.demo_dir or str(task_success_dir(FLAGS.exp_name))
+    success_dir = FLAGS.success_dir or str(task_success_dir(FLAGS.exp_name))
 
     return (
         config,
@@ -442,7 +424,7 @@ def main(_):
             checkpoints.save_checkpoint(
                 checkpoint_path, classifier, step=epoch + 1, keep=5, overwrite=True
             )
-            print(f"  → Best model saved (val_acc={best_val_accuracy:.4f})")
+            print(f"  -> Best model saved (val_acc={best_val_accuracy:.4f})")
         elif (epoch + 1) % 10 == 0:
             checkpoints.save_checkpoint(
                 checkpoint_path, classifier, step=epoch + 1, keep=5, overwrite=True

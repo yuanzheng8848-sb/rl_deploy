@@ -87,7 +87,7 @@ class JaxRLTrainState(struct.PyTreeNode):
 
     Also generalizes the TrainState to support an arbitrary pytree of
     optimizers, `txs`. When `apply_gradients()` is called, the `grads` argument
-    must have `txs` as a prefix. This is backwards-compatible, meaning `txs` can
+    must have `txs` as a prefix. Existing callers may still pass `txs`, which can
     be a single optimizer and `grads` can be a single tree with the same
     structure as `self.params`.
 

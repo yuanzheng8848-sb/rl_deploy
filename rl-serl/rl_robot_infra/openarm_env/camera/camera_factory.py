@@ -1,10 +1,12 @@
 """Camera factory for OpenArm hardware variants."""
 
 
-def build_camera(name, cfg, fake_env=False, mock_camera_cls=None):
+def build_camera(name, cfg, virtual=False, mock_camera_cls=None):
     camera_type = cfg.get("type", "").lower()
 
-    if fake_env and mock_camera_cls is not None:
+    if virtual:
+        if mock_camera_cls is None:
+            raise ValueError("virtual camera mode requires a mock_camera_cls")
         return mock_camera_cls(
             width=cfg.get("width", 640),
             height=cfg.get("height", 480),

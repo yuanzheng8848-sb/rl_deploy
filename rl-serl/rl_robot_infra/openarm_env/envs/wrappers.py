@@ -1,25 +1,4 @@
-"""OpenArm-specific gym wrappers (migrated from rl_deploy/train.py).
-
-These are the robot-specific wrappers kept for rl-serl. Task-agnostic wrappers
-(ChunkingWrapper / SERLObsWrapper) are reused from rl_launcher via
-rl_launcher.wrappers.
-
-Migrated wrappers:
-  - DualRelativeFrame            : dual-arm relative-frame transform
-  - Quat2EulerWrapper            : tcp_pose quaternion -> euler
-  - NetworkPrimaryImageCropWrapper : center-crop image_primary for policy stream
-  - GripperPenaltyWrapper        : HIL-SERL learned-gripper penalty
-  - DualSpacemouseIntervention   : bimanual evdev teleop + /control bridge
-
-Intentionally NOT migrated (removed features):
-  - ArmFocusWrapper / arm_focus_*   (single-arm focus scaffolding)
-  - KeyboardRewardWrapper           (reward now comes from the vision classifier)
-  - Handoff-focus tagging
-References to those in the original DualSpacemouseIntervention have been removed:
-  every arm is always active, actions are never masked, and intervention
-  transitions carry reward 0 (the outer MultiCameraBinaryRewardClassifierWrapper
-  supplies reward).
-"""
+"""OpenArm-specific Gymnasium wrappers."""
 import fcntl
 import os
 import time
@@ -49,7 +28,7 @@ except Exception:  # pragma: no cover - evdev/hardware dependent
 
 
 # ---------------------------------------------------------------------------
-# obs stacking helper (migrated from train.py stack_obs)
+# Observation stacking helper.
 # ---------------------------------------------------------------------------
 def stack_obs(obs):
     import jax
@@ -63,7 +42,7 @@ def stack_obs(obs):
 
 
 # ---------------------------------------------------------------------------
-# image crop helpers (migrated from train.py)
+# Image crop helpers.
 # ---------------------------------------------------------------------------
 def crop_rgb_image(img, crop_ratio, y_offset_ratio=0.0):
     img = np.asarray(img)
@@ -117,7 +96,7 @@ def crop_primary_image_for_network(
 
 
 # ---------------------------------------------------------------------------
-# grasp penalty helpers (migrated from train.py)
+# Grasp penalty helpers.
 # ---------------------------------------------------------------------------
 def compute_grasp_penalty(action, last_binary_state, penalty, open_threshold, close_threshold):
     action = np.asarray(action, dtype=np.float32).reshape(-1)
@@ -137,6 +116,45 @@ def compute_grasp_penalty(action, last_binary_state, penalty, open_threshold, cl
         if next_state != last_state:
             penalty_value += float(penalty)
     return np.asarray(penalty_value, dtype=np.float32)
+
+
+# ===========================================================================
+# Policy obs adapter
+# ===========================================================================
+class OpenArmPolicyObsAdapter:
+    """Convert base OpenArm observations into the policy observation space."""
+
+    def __init__(
+        self,
+        relative_wrapper=None,
+        quat_wrapper=None,
+        crop_wrapper=None,
+        serl_wrapper=None,
+        chunking_wrapper=None,
+    ):
+        self.relative_wrapper = relative_wrapper
+        self.quat_wrapper = quat_wrapper
+        self.crop_wrapper = crop_wrapper
+        self.serl_wrapper = serl_wrapper
+        self.chunking_wrapper = chunking_wrapper
+
+    def __call__(self, raw_obs):
+        obs = raw_obs
+        if self.relative_wrapper is not None:
+            tcp_pose = np.asarray(obs["state"]["tcp_pose"])
+            self.relative_wrapper.left_transform = construct_adjoint_matrix(tcp_pose[0])
+            self.relative_wrapper.right_transform = construct_adjoint_matrix(tcp_pose[1])
+            obs = self.relative_wrapper.transform_observation(obs)
+        if self.quat_wrapper is not None:
+            obs = self.quat_wrapper.observation(obs)
+        if self.crop_wrapper is not None:
+            obs = self.crop_wrapper.observation(obs)
+        if self.serl_wrapper is not None:
+            obs = self.serl_wrapper.observation(obs)
+        if self.chunking_wrapper is not None:
+            self.chunking_wrapper.current_obs.append(obs)
+            obs = stack_obs(self.chunking_wrapper.current_obs)
+        return obs
 
 
 # ===========================================================================
@@ -329,10 +347,9 @@ class GripperPenaltyWrapper(gym.Wrapper):
 class DualSpacemouseIntervention(gym.ActionWrapper):
     """Bimanual teleop wrapper preserving OpenArm control semantics.
 
-    Migrated from rl_deploy/train.py with arm-focus and keyboard-reward
-    dependencies removed: every arm is always active, actions are never masked,
-    and intervention transitions carry reward 0 (reward is supplied by the outer
-    MultiCameraBinaryRewardClassifierWrapper). Requires the base env to expose
+    Every arm is always active, actions are never masked, and intervention
+    transitions use the outer MultiCameraBinaryRewardClassifierWrapper reward.
+    Requires the base env to expose
     refresh_obs() / currpos / gripper_binary_state / session / url and the flask
     server's /control/* routes.
     """
@@ -357,6 +374,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         servo_gripper_step=0.05,
         transition_sample_delay=0.0,
         print_raw=False,
+        policy_obs_adapter=None,
     ):
         super().__init__(env)
         self.left_event_path = left_event_path
@@ -376,6 +394,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         self.servo_gripper_step = float(servo_gripper_step)
         self.transition_sample_delay = float(transition_sample_delay)
         self.print_raw = bool(print_raw)
+        self.policy_obs_adapter = policy_obs_adapter
 
         self.axis_codes = {}
         if ecodes is not None:
@@ -548,31 +567,9 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         return self._find_wrapper(self.env, ChunkingWrapper)
 
     def _transform_obs_to_policy_space(self, raw_obs):
-        obs = raw_obs
-        relative_wrapper = self._find_wrapper(self.env, DualRelativeFrame)
-        if relative_wrapper is not None:
-            tcp_pose = np.asarray(obs["state"]["tcp_pose"])
-            relative_wrapper.left_transform = construct_adjoint_matrix(tcp_pose[0])
-            relative_wrapper.right_transform = construct_adjoint_matrix(tcp_pose[1])
-            obs = relative_wrapper.transform_observation(obs)
-
-        quat_wrapper = self._find_wrapper(self.env, Quat2EulerWrapper)
-        if quat_wrapper is not None:
-            obs = quat_wrapper.observation(obs)
-
-        crop_wrapper = self._find_wrapper(self.env, NetworkPrimaryImageCropWrapper)
-        if crop_wrapper is not None:
-            obs = crop_wrapper.observation(obs)
-
-        serl_wrapper = self._find_wrapper(self.env, SERLObsWrapper)
-        if serl_wrapper is not None:
-            obs = serl_wrapper.observation(obs)
-
-        chunking_wrapper = self._get_chunking_wrapper()
-        if chunking_wrapper is not None:
-            chunking_wrapper.current_obs.append(obs)
-            obs = stack_obs(chunking_wrapper.current_obs)
-        return obs
+        if self.policy_obs_adapter is None:
+            raise RuntimeError("DualSpacemouseIntervention requires a policy_obs_adapter")
+        return self.policy_obs_adapter(raw_obs)
 
     def _transform_action_to_base(self, action):
         transformed = np.array(action, copy=True)

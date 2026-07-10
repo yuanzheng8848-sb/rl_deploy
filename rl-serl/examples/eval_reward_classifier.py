@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Evaluate trained reward classifier for OpenArm (rl-serl).
 
-Migrated from rl_deploy/classifier/eval_classifier.py. Loads checkpoint and
-evaluates on success demo images. The saved demo image_primary is already the
-policy/classifier view produced by NetworkPrimaryImageCropWrapper.
+Loads checkpoint and evaluates on success demo images. The saved demo
+image_primary is already the policy/classifier view produced by
+NetworkPrimaryImageCropWrapper.
 
 Uses the SAME sampling rule as classifier training:
   - Positive samples: last N frames of success trajectories (task completed)
@@ -18,7 +18,7 @@ Extended with detailed analysis:
   - Misclassified sample analysis
   - All results saved to checkpoint directory
 """
-import compat  # noqa: F401
+import project_paths  # noqa: F401
 
 import glob
 import os
@@ -46,11 +46,6 @@ flags.DEFINE_string("exp_name", "openarm_pickplace", "Experiment name in CONFIG_
 flags.DEFINE_string("checkpoint_path", None, "Checkpoint directory. Defaults to task config.")
 flags.DEFINE_integer("checkpoint_step", 0, "Checkpoint step (0=latest)")
 flags.DEFINE_string("success_dir", None, "Success pkl directory. Defaults to the task folder.")
-flags.DEFINE_string(
-    "failure_dir",
-    None,
-    "Deprecated: negative samples now come from success trajectory head frames. Ignored if provided.",
-)
 flags.DEFINE_string(
     "image_key",
     None,
@@ -354,7 +349,7 @@ def main(_):
     for idx, (img, label) in enumerate(tqdm(all_data)):
         obs = {IMAGE_KEY: img}
         logits = classifier.apply_fn({"params": classifier.params}, obs, train=False)
-        # Squeeze to scalar before int() conversion: (1,) or (1, 1) → ()
+        # Squeeze to scalar before int() conversion: (1,) or (1, 1) -> ().
         if logits.ndim > 0:
             logits = logits.squeeze()
 

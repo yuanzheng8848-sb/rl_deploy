@@ -1,11 +1,9 @@
 """OpenArm pick-and-place task config for rl-serl.
 
-Mirrors hil-serl/examples/experiments/ram_insertion/config.py. Assembles the
-wrapper stack (migrated OpenArm wrappers + rl_launcher generic wrappers) and,
-when classifier=True, attaches the vision reward classifier via
-MultiCameraBinaryRewardClassifierWrapper.
+Assembles the OpenArm wrapper stack and, when classifier=True, attaches the
+vision reward classifier via MultiCameraBinaryRewardClassifierWrapper.
 
-Reward design (see rl-serl/REFACTOR_PLAN.md §4):
+Reward design:
   - single top camera (image_primary) only
   - classifier consumes the SAME center-cropped image_primary used by the policy
     (NetworkPrimaryImageCropWrapper runs BEFORE the classifier wrapper)
@@ -21,6 +19,7 @@ from openarm_env.envs.wrappers import (
     NetworkPrimaryImageCropWrapper,
     GripperPenaltyWrapper,
     DualSpacemouseIntervention,
+    OpenArmPolicyObsAdapter,
 )
 from openarm_env.envs.reward_wrappers import MultiCameraBinaryRewardClassifierWrapper
 
@@ -36,7 +35,7 @@ PROPRIO_KEYS = ["tcp_pose", "tcp_vel", "gripper_pose"]
 # Reward classifier uses only the top camera.
 CLASSIFIER_KEYS = ["image_primary"]
 
-# Default network-crop params (carried from rl_deploy/train.py FLAGS).
+# Default network-crop params.
 NETWORK_PRIMARY_CROP_RATIO = 0.3
 NETWORK_PRIMARY_CROP_Y_OFFSET = 0.0
 
@@ -66,7 +65,7 @@ class TrainConfig(DefaultTrainingConfig):
     setup_mode = "dual-arm-learned-gripper"
     encoder_type = "resnet-pretrained"
 
-    # teleop / servo params (carried from rl_deploy/train.py FLAGS defaults)
+    # Teleop / servo params.
     network_crop_primary = True
     network_primary_crop_ratio = NETWORK_PRIMARY_CROP_RATIO
     network_primary_crop_y_offset = NETWORK_PRIMARY_CROP_Y_OFFSET
@@ -78,30 +77,44 @@ class TrainConfig(DefaultTrainingConfig):
     classifier_failure_head_frames = CLASSIFIER_FAILURE_HEAD_FRAMES
     classifier_ckpt_path = DEFAULT_CLASSIFIER_CKPT
 
-    def get_environment(self, fake_env=False, save_video=False, classifier=False):
+    def get_environment(self, env_mode="real", classifier=False):
+        if env_mode not in ("real", "virtual"):
+            raise ValueError(f"env_mode must be 'real' or 'virtual', got {env_mode!r}")
+
         env = LocalOpenArmEnv(
-            fake_env=fake_env,
-            save_video=save_video,
+            env_mode=env_mode,
             hz=self.hz,
             config=EnvConfig(),
             max_episode_length=self.max_traj_length,
         )
 
-        env = DualRelativeFrame(env)
-        env = Quat2EulerWrapper(env)
+        relative_wrapper = DualRelativeFrame(env)
+        env = relative_wrapper
+        quat_wrapper = Quat2EulerWrapper(env)
+        env = quat_wrapper
+        crop_wrapper = None
         if self.network_crop_primary:
-            env = NetworkPrimaryImageCropWrapper(
+            crop_wrapper = NetworkPrimaryImageCropWrapper(
                 env,
                 crop_ratio=self.network_primary_crop_ratio,
                 y_offset_ratio=self.network_primary_crop_y_offset,
             )
-        env = SERLObsWrapper(env, proprio_keys=self.proprio_keys)
-        env = ChunkingWrapper(env, obs_horizon=1, act_exec_horizon=None)
+            env = crop_wrapper
+        serl_wrapper = SERLObsWrapper(env, proprio_keys=self.proprio_keys)
+        env = serl_wrapper
+        chunking_wrapper = ChunkingWrapper(env, obs_horizon=1, act_exec_horizon=None)
+        env = chunking_wrapper
         env = GripperPenaltyWrapper(env, penalty=self.grasp_penalty)
 
-        # SpaceMouse intervention only on the real actor (not fake/learner).
-        if not fake_env:
-            env = DualSpacemouseIntervention(env)
+        if env_mode == "real":
+            policy_obs_adapter = OpenArmPolicyObsAdapter(
+                relative_wrapper=relative_wrapper,
+                quat_wrapper=quat_wrapper,
+                crop_wrapper=crop_wrapper,
+                serl_wrapper=serl_wrapper,
+                chunking_wrapper=chunking_wrapper,
+            )
+            env = DualSpacemouseIntervention(env, policy_obs_adapter=policy_obs_adapter)
 
         if classifier:
             # Load classifier and reward function from base class.

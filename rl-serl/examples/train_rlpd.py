@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """RLPD training entrypoint for OpenArm (rl-serl).
 
-Migrated and slimmed from rl_deploy/train.py. Keeps the actor / learner / eval
-loops and the agentlace client/server wiring, but drops the removed features:
-  - Arm-Focus scaffolding
-  - KeyboardRewardWrapper (reward now comes from the vision classifier)
-  - Handoff-Focus tagging + demo-buffer repeat insertion
-  - Episode diagnostic metrics (joint-distance / monotonicity / autonomy / ...)
-
 Environment assembly lives in experiments/<exp_name>/config.py via
-CONFIG_MAPPING; this file no longer hard-codes any task/robot logic.
+CONFIG_MAPPING; this file keeps task and robot details out of the launcher.
 
 Usage:
   python train_rlpd.py --exp_name openarm_pickplace --learner
@@ -35,7 +28,7 @@ def _append_xla_flag(flag):
         os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
 
 
-# Must be set before importing compat/JAX. The default JAX preallocation on this
+# Must be set before importing JAX. The default JAX preallocation on this
 # machine leaves too little room for actor/eval. 0.56 is about 9 GiB when the
 # previous default preallocation was about 12 GiB.
 if _argv_flag_enabled("learner"):
@@ -47,7 +40,7 @@ elif _argv_flag_enabled("actor"):
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.31")
     _append_xla_flag("--xla_gpu_autotune_level=0")
 
-import compat  # noqa: F401  (sets sys.path + CUDA/JAX patches; must be first)
+import project_paths  # noqa: F401  (sets local package paths; must be first)
 
 import copy
 import glob
@@ -60,10 +53,6 @@ import numpy as np
 import tqdm
 from absl import app, flags
 from flax.training import checkpoints
-try:
-    from pynput import keyboard
-except Exception:  # pragma: no cover - optional desktop dependency
-    keyboard = None
 
 import jax
 import jax.numpy as jnp
@@ -89,8 +78,7 @@ flags.DEFINE_boolean("learner", False, "Run learner loop.")
 flags.DEFINE_boolean("actor", False, "Run actor loop.")
 flags.DEFINE_boolean("eval", False, "Run evaluation loop.")
 flags.DEFINE_boolean("debug", False, "Disable wandb when true.")
-flags.DEFINE_boolean("mock", False, "Use fake env / mock hardware observations.")
-flags.DEFINE_boolean("save_video", False, "Compatibility flag for env creation.")
+flags.DEFINE_enum("env_mode", "real", ["real", "virtual"], "Environment mode.")
 flags.DEFINE_string("ip", "localhost", "Learner IP.")
 flags.DEFINE_string(
     "checkpoint_path",
@@ -108,7 +96,7 @@ flags.DEFINE_integer("eval_n_trajs", 5, "Number of evaluation trajectories.")
 flags.DEFINE_boolean(
     "render_actor",
     True,
-    "Render actor camera images, classifier reference probability, and keyboard reward prompts.",
+    "Render actor camera images and classifier probability.",
 )
 flags.DEFINE_float("render_fps", 20.0, "Actor render refresh cap.")
 
@@ -130,45 +118,6 @@ def print_green(text):
 
 def print_yellow(text):
     print(f"\033[93m {text}\033[00m")
-
-
-def make_keyboard_state():
-    return {"label": None, "quit_requested": False}
-
-
-def start_keyboard_listener(state):
-    if keyboard is None:
-        print_yellow("[Actor] pynput unavailable; keyboard labels require the OpenCV window focus.")
-        return None
-
-    def on_press(key):
-        try:
-            if key == keyboard.Key.enter:
-                state["label"] = "success"
-                print_green("[Actor] ENTER -> success requested")
-            elif key == keyboard.Key.space:
-                state["label"] = "failure"
-                print_yellow("[Actor] SPACE -> failure requested")
-            elif key == keyboard.Key.esc:
-                state["quit_requested"] = True
-                print_yellow("[Actor] ESC -> quit requested")
-        except Exception:
-            pass
-
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    return listener
-
-
-def consume_keyboard_label(state):
-    if state.get("quit_requested"):
-        state["quit_requested"] = False
-        return "quit"
-    label = state.get("label")
-    if label:
-        state["label"] = None
-        return label
-    return None
 
 
 def _cfg_value(config, name, override):
@@ -374,7 +323,7 @@ def render_actor_feedback(obs, image_keys, reward, classifier_prob, classifier_t
         )
         cv2.putText(
             panel,
-            "ENTER=success  SPACE=failure  q=quit",
+            "q=quit",
             (12, 120),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -388,10 +337,6 @@ def render_actor_feedback(obs, image_keys, reward, classifier_prob, classifier_t
         cv2.imshow("rl-serl actor reward", np.concatenate(panels, axis=1))
     delay = max(1, int(1000 / max(float(FLAGS.render_fps), 1.0)))
     key = cv2.waitKey(delay) & 0xFF
-    if key in (10, 13):
-        return "success"
-    if key == ord(" "):
-        return "failure"
     if key in (27, ord("q")):
         return "quit"
     return None
@@ -473,8 +418,6 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
     client.recv_network_callback(update_params)
 
     obs, _ = env.reset()
-    keyboard_state = make_keyboard_state()
-    keyboard_listener = start_keyboard_listener(keyboard_state)
     timer = Timer()
     running_return = 0.0
     already_intervened = False
@@ -512,7 +455,7 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
 
                 if info.get("intervention_idle", False):
                     classifier_prob = classifier_prob_fn(obs) if classifier_prob_fn is not None else 0.0
-                    cv2_label = render_actor_feedback(
+                    render_label = render_actor_feedback(
                         obs,
                         config.image_keys,
                         0.0,
@@ -520,8 +463,7 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                         classifier_threshold,
                         False,
                     )
-                    key_label = consume_keyboard_label(keyboard_state) or cv2_label
-                    if key_label == "quit":
+                    if render_label == "quit":
                         break
                     timer.tock("total")
                     if step % config.log_period == 0 and last_timer_stats_step != step:
@@ -530,7 +472,7 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                     continue
 
                 classifier_prob = classifier_prob_fn(next_obs) if classifier_prob_fn is not None else 0.0
-                cv2_label = render_actor_feedback(
+                render_label = render_actor_feedback(
                     next_obs,
                     config.image_keys,
                     reward,
@@ -538,19 +480,8 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                     classifier_threshold,
                     done or truncated,
                 )
-                key_label = consume_keyboard_label(keyboard_state) or cv2_label
-                if key_label == "quit":
+                if render_label == "quit":
                     break
-                keyboard_reward = None
-                keyboard_done = False
-                if key_label == "success":
-                    keyboard_reward = 1.0
-                    keyboard_done = True
-                    print_green("[Actor] ENTER -> success reward=1, ending episode.")
-                elif key_label == "failure":
-                    keyboard_reward = 0.0
-                    keyboard_done = True
-                    print_yellow("[Actor] SPACE -> failure reward=0, restarting episode.")
 
                 intervened = "intervene_action" in info
                 if intervened:
@@ -567,14 +498,16 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                         "observations": sampled_transition["observations"],
                         "actions": np.asarray(sampled_transition["actions"], dtype=np.float32),
                         "next_observations": sampled_transition["next_observations"],
-                        "rewards": np.asarray(sampled_transition["rewards"], dtype=np.float32),
-                        "masks": np.asarray(1.0 - float(sampled_transition["dones"]), dtype=np.float32),
-                        "dones": bool(sampled_transition["dones"]),
+                        "rewards": np.asarray(reward, dtype=np.float32),
+                        "masks": np.asarray(
+                            1.0 - float(done), dtype=np.float32
+                        ),
+                        "dones": bool(done),
+                        "truncated": bool(truncated),
                         "infos": copy.deepcopy(sampled_transition.get("infos", info)),
                     }
                     reward = transition["rewards"]
                     done = transition["dones"]
-                    truncated = bool(sampled_transition.get("truncated", False))
                     intervened = True
                 else:
                     transition = {
@@ -584,19 +517,9 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                         "rewards": np.asarray(reward, dtype=np.float32),
                         "masks": np.asarray(1.0 - float(done), dtype=np.float32),
                         "dones": bool(done),
+                        "truncated": bool(truncated),
                         "infos": copy.deepcopy(info),
                     }
-
-                if keyboard_reward is not None:
-                    reward = np.asarray(keyboard_reward, dtype=np.float32)
-                    done = bool(keyboard_done)
-                    truncated = False
-                    transition["rewards"] = reward
-                    transition["dones"] = done
-                    transition["masks"] = np.asarray(1.0 - float(done), dtype=np.float32)
-                    transition["infos"] = copy.deepcopy(transition["infos"])
-                    transition["infos"]["keyboard_label"] = key_label
-                    transition["infos"]["succeed"] = key_label == "success"
 
                 transition["infos"] = copy.deepcopy(transition["infos"])
                 transition["infos"]["classifier_prob"] = float(classifier_prob)
@@ -628,7 +551,6 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                         }
                     info["episode"]["intervention_count"] = intervention_count
                     info["episode"]["intervention_steps"] = intervention_steps
-                    info["episode"]["keyboard_label"] = key_label
                     info["episode"]["classifier_prob"] = float(classifier_prob)
                     info["episode"]["classifier_reference_success"] = bool(
                         classifier_prob > classifier_threshold
@@ -658,8 +580,6 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
             step += 1
             pbar.update(1)
     finally:
-        if keyboard_listener is not None:
-            keyboard_listener.stop()
         if FLAGS.render_actor:
             cv2.destroyAllWindows()
     pbar.close()
@@ -796,12 +716,14 @@ def main(_):
     rng = jax.random.PRNGKey(config.seed if hasattr(config, "seed") else FLAGS.seed)
     rng, sampling_rng = jax.random.split(rng)
 
-    # learner uses a fake env (no hardware). Eval keeps classifier reward.
-    # Actor uses keyboard reward; classifier is loaded separately as a reference.
+    env_mode = FLAGS.env_mode
+    if FLAGS.learner:
+        env_mode = "virtual"
+
+    # Learner uses virtual env (no hardware). Actor/eval use classifier reward.
     env = config.get_environment(
-        fake_env=FLAGS.learner or FLAGS.mock,
-        save_video=FLAGS.save_video,
-        classifier=FLAGS.eval,
+        env_mode=env_mode,
+        classifier=FLAGS.actor or FLAGS.eval,
     )
 
     print(f"Exp: {FLAGS.exp_name} | image_keys={config.image_keys}")

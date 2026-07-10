@@ -1,4 +1,4 @@
-import os
+﻿import os
 
 # This process only serves hardware/camera/IK requests and should never reserve
 # training GPU memory. Force all downstream frameworks (e.g. JAX) onto CPU.
@@ -18,30 +18,19 @@ import yaml
 
 from openarm_env.camera.camera_factory import build_camera, camera_frame
 
-# --- 閰嶇疆 ---
-USE_MOCK = False  # Set to True to use Mock Hardware, False for Real Hardware
+# --- Paths ---
 
-# --- 璺緞閰嶇疆 ---
-# 璇ユ枃浠朵綅?rl-serl/rl_robot_infra/robot_servers/openarm_server.py
+# Server module location.
+# rl-serl/rl_robot_infra/robot_servers/openarm_server.py
 # OpenArm control, IK, camera, configs, and description now live under rl_robot_infra.
 # parents: [0]=robot_servers [1]=rl_robot_infra [2]=rl-serl [3]=zy
 INFRA_ROOT = Path(__file__).resolve().parents[1]
 
-# --- 瀵煎叆璺緞 ---
+# --- Hardware controller ---
 
-# --- 瀵煎叆鎺у埗?---
-if USE_MOCK:
-    print(">>> MODE: MOCK HARDWARE <<<")
-    from openarm_env.mock_hardware import MockOpenArmController as HardwareController
-else:
-    print(">>> MODE: REAL HARDWARE <<<")
-    try:
-        from openarm_control.controller import OpenArmController as HardwareController
-    except ImportError as e:
-        print(f"[Server Error] Cannot import OpenArmController: {e}")
-        print("Falling back to Mock Hardware due to import error.")
-        from openarm_env.mock_hardware import MockOpenArmController as HardwareController
-        USE_MOCK = True
+# Real hardware only.
+print(">>> MODE: REAL HARDWARE <<<")
+from openarm_control.controller import OpenArmController as HardwareController
 
 # --- IK solver imports ---
 # Converts Gym Cartesian commands into controller joint commands.
@@ -59,17 +48,17 @@ app = Flask(__name__)
 
 class OpenArmServer:
     def __init__(self):
-        print(f"Initializing {'Mock' if USE_MOCK else 'Real'} OpenArm Hardware Controller...")
-        # 1. 鍒濆鍖栫‖浠舵帶鍒跺櫒 (鍙岃噦)
+        print("Initializing Real OpenArm Hardware Controller...")
+        # Hardware controller.
         self.controller = HardwareController(enable_left=True, enable_right=True)
         
-        # 2. 鍒濆?IK 姹傝В??Viser
+        # IK solver and optional Viser visualization.
         self.ik_solver = None
         self.viser = None
         if IK_AVAILABLE:
             self._init_ik_and_viser()
 
-        # 鐢ㄤ簬绾跨▼瀹夊叏鐨勯攣 (铏界劧 Flask 鏄绾跨▼鐨勶紝?CAN 閫氳閫氬父涓嶆槸绾跨▼瀹夊叏?
+        # Locks protect hardware, camera, and servo state across Flask threads.
         self.lock = threading.Lock()
         self.camera_lock = threading.Lock()
         self.servo_lock = threading.Lock()
@@ -111,11 +100,9 @@ class OpenArmServer:
         
         # Initialize Cameras
         self.cameras = {}
-        if not USE_MOCK:
-            self._init_cameras()
-            # Start camera thread
-            self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
-            self.camera_thread.start()
+        self._init_cameras()
+        self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
+        self.camera_thread.start()
 
     def _init_ik_and_viser(self):
         """Initialize the IK solver and optional Viser visualization."""
@@ -125,15 +112,15 @@ class OpenArmServer:
             with open(cfg_path / "solver.yaml") as f: s_cfg = yaml.safe_load(f)
             with open(cfg_path / "viser.yaml") as f: v_cfg = yaml.safe_load(f)
             
-            # 淇 URDF 璺緞鎸囧悜
+            # Resolve URDF package paths to this repository.
             r_cfg["description"]["package_path"] = str(INFRA_ROOT)
             
             self.ik_solver = BaseIKSolver(s_cfg, r_cfg, visualize_collision=False)
             
-            # JAX Warmup (棰勭紪?IK 璁＄畻?
+            # Warm up JAX IK compilation.
             print("Warming up JAX IK Solver...")
             dummy_q = np.zeros(14)
-            # 杩欓噷?target 鏍煎紡鍙栧喅浜庢眰瑙ｅ櫒锛屽亣璁句负 [w, x, y, z, px, py, pz]
+            # IK target format: [w, x, y, z, px, py, pz].
             dummy_target = np.array([
                 [1,0,0,0, 0.3, 0.2, 0.3], 
                 [1,0,0,0, 0.3, -0.2, 0.3]
@@ -141,7 +128,7 @@ class OpenArmServer:
             self.ik_solver.solve_ik(dummy_target, dummy_q)
             print("IK Solver Ready.")
 
-            # 鍒濆?Viser
+            # Optional Viser visualization.
             if ViserBase:
                 print("Initializing Viser...")
                 v_cfg["nb_vis_frames"] = 6
@@ -222,7 +209,7 @@ class OpenArmServer:
         for name, cfg in self.cam_configs.items():
             try:
                 print(f"Initializing Camera {name}...")
-                cam = build_camera(name, cfg, fake_env=USE_MOCK)
+                cam = build_camera(name, cfg, virtual=False)
                 self.cameras[name] = cam
                 self.latest_frames[name] = None
                 print(f"Initialized {name} camera.")
@@ -242,23 +229,8 @@ class OpenArmServer:
 
     def _get_current_joint_and_gripper(self):
         with self.lock:
-            if hasattr(self.controller, "read_state"):
-                state = self.controller.read_state()
-                return state.q.copy(), state.gripper_q.copy()
-            q_l_curr, g_l_curr = self.controller.get_left_position()
-            q_r_curr, g_r_curr = self.controller.get_right_position()
-
-        if q_l_curr is None:
-            q_l_curr = np.zeros(7)
-        if q_r_curr is None:
-            q_r_curr = np.zeros(7)
-        if not g_l_curr:
-            g_l_curr = [0.0]
-        if not g_r_curr:
-            g_r_curr = [0.0]
-        q_curr = np.concatenate([q_l_curr, q_r_curr])
-        g_curr = np.array([g_l_curr[0], g_r_curr[0]], dtype=np.float64)
-        return q_curr, g_curr
+            state = self.controller.read_state()
+            return state.q.copy(), state.gripper_q.copy()
 
     def _get_current_pose(self, q_curr):
         pose = np.zeros((2, 7), dtype=np.float64)
@@ -521,34 +493,28 @@ class OpenArmServer:
                 continue
 
             with self.lock:
-                if hasattr(self.controller, "command_joint_target"):
-                    ok, command_info = self.controller.command_joint_target(
-                        q_target,
-                        gripper_target=stepped_gripper,
+                ok, command_info = self.controller.command_joint_target(
+                    q_target,
+                    gripper_target=stepped_gripper,
+                    active_arms=active_arms,
+                    dt=max(1.0 / self.servo_hz, 0.001),
+                    source=f"servo:{backend}",
+                )
+                if not ok:
+                    self._update_servo_debug(
+                        status="safety_blocked",
+                        error=str(command_info.get("safety", {})),
+                        backend=backend,
                         active_arms=active_arms,
-                        dt=max(1.0 / self.servo_hz, 0.001),
-                        source=f"servo:{backend}",
+                        target_pose=stepped_pose,
+                        current_pose=current_pose,
+                        q_target=q_target,
+                        current_gripper=g_curr,
+                        target_gripper=target_gripper,
+                        stepped_gripper=stepped_gripper,
                     )
-                    if not ok:
-                        self._update_servo_debug(
-                            status="safety_blocked",
-                            error=str(command_info.get("safety", {})),
-                            backend=backend,
-                            active_arms=active_arms,
-                            target_pose=stepped_pose,
-                            current_pose=current_pose,
-                            q_target=q_target,
-                            current_gripper=g_curr,
-                            target_gripper=target_gripper,
-                            stepped_gripper=stepped_gripper,
-                        )
-                        self._maybe_log_servo_debug()
-                        continue
-                else:
-                    if 0 in active_arms:
-                        self.controller.set_left_position(q_target[:7], float(stepped_gripper[0]), q_curr[:7], float(g_curr[0]))
-                    if 1 in active_arms:
-                        self.controller.set_right_position(q_target[7:], float(stepped_gripper[1]), q_curr[7:], float(g_curr[1]))
+                    self._maybe_log_servo_debug()
+                    continue
             self._update_servo_debug(
                 status="command_sent",
                 backend=backend,
@@ -660,39 +626,35 @@ class OpenArmServer:
         """Return robot state, including encoded images."""
         rich_state = None
         with self.lock:
-            # 璇诲彇鍏宠妭鍜屽す鐖姸?
-            if hasattr(self.controller, "read_state"):
-                rich_state = self.controller.read_state()
-                l_pos = rich_state.left.q
-                r_pos = rich_state.right.q
-                l_grip = rich_state.left.gripper_q
-                r_grip = rich_state.right.gripper_q
-            else:
-                l_pos, l_grip = self.controller.get_left_position()
-                r_pos, r_grip = self.controller.get_right_position()
+            # Read joint and gripper state.
+            rich_state = self.controller.read_state()
+            l_pos = rich_state.left.q
+            r_pos = rich_state.right.q
+            l_grip = rich_state.left.gripper_q
+            r_grip = rich_state.right.gripper_q
             
-        # 澶勭悊 None
+        # Normalize missing values.
         if l_pos is None: l_pos = np.zeros(7)
         if r_pos is None: r_pos = np.zeros(7)
         if not l_grip: l_grip = [0.0]
         if not r_grip: r_grip = [0.0]
         
-        # 鎷兼帴鍏宠妭鏁版嵁 (14?
+        # Concatenate joint positions into a 14-D vector.
         q = np.concatenate([l_pos, r_pos])
         
-        # 鎷兼帴澶圭埅鏁版嵁 (2?
+        # Pack gripper positions into a 2-D vector.
         gripper = np.array([l_grip[0], r_grip[0]])
 
-        # 璁＄畻鏈浣嶅Э (Forward Kinematics)
-        # 鍗充娇娌℃湁 IK 姹傝В鍣紝涔熷敖閲忚繑鍥炴暟鎹紝?pose 灏嗕负 0
+        # Compute end-effector pose with forward kinematics.
+        # If IK is unavailable, keep pose as zeros and still return state data.
         pose = np.zeros(14)
         if self.ik_solver:
-            # IK Solver 閫氬父杩斿洖: [w, qx, qy, qz, px, py, pz]
-            # Gym Env 閫氬父鏈熸湜: [px, py, pz, rx, ry, rz, rw] (OpenArmEnv logic)
+            # IK solver returns [w, qx, qy, qz, px, py, pz].
+            # OpenArmEnv expects [px, py, pz, qx, qy, qz, qw].
             ik_poses = self.ik_solver.get_current_ee_pose(q)
             for i in range(2):
                 p = ik_poses[i]
-                # 杞崲鏍煎紡: [w, x, y, z, x, y, z] -> [x, y, z, x, y, z, w]
+                # Convert [w, x, y, z, px, py, pz] -> [px, py, pz, x, y, z, w].
                 pose[i*7 : i*7+3] = p[4:7] # Pos
                 pose[i*7+3 : i*7+6] = p[1:4] # Rot (quat xyz)
                 pose[i*7+6] = p[0]         # Rot (quat w)
@@ -720,7 +682,7 @@ class OpenArmServer:
             "pose": pose.tolist(),
             "q": q.tolist(),
             "gripper_pos": gripper.tolist(),
-            "vel": [0.0] * 12,     # 绗涘崱灏旈€熷害
+            "vel": [0.0] * 12,     # Cartesian velocity placeholder.
             "dq": dq,
             "force": [0.0] * 6,
             "torque": [0.0] * 6,
@@ -732,11 +694,11 @@ class OpenArmServer:
             "servo_debug": self._jsonify_servo_debug(),
         }
         
-        # 鏇存柊鍙?
+        # Update Viser visualization.
         if self.viser:
             self.viser.update_joints(q)
 
-        # 鑾峰彇鏈€鏂板浘鍍忓苟缂栫爜
+        # Encode latest camera frames.
         encoded_images = {}
         if include_images:
             with self.camera_lock:
@@ -769,10 +731,10 @@ class OpenArmServer:
             result["safety"] = diagnostics.get("safety", {})
         return result
 
-# --- 瀹炰緥?Server ---
+# --- Server instance ---
 server = OpenArmServer()
 
-# --- Flask 璺敱瀹氫箟 ---
+# --- Flask routes ---
 
 @app.route("/getstate", methods=["POST"])
 def route_get_state():
@@ -921,7 +883,5 @@ def route_control_home():
         return str(e), 500
 
 if __name__ == "__main__":
-    # 鍚姩 Flask 鏈嶅姟
-    # threaded=True 鍏佽骞跺彂璇锋眰锛堣櫧?CAN 鎿嶄綔鍔犱簡閿侊級
     print("Starting OpenArm Server on port 5000...")
     app.run(host="0.0.0.0", port=5000, threaded=True)
