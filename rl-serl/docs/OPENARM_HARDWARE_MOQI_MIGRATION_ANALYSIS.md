@@ -422,4 +422,4 @@ rg -n "moqi_workspace|ROOT_DIR = .*moqi|connection\\.cameras" rl-serl
 
 按当前代码，`rl-serl` 已经完成了 `rl_deploy` 层迁移；剩余迁移量主要是底层 OpenArm SDK/IK/相机/描述文件。为了达到和直接依赖 `moqi_workspace` 一样的效果，最少要迁移 `openarm_controller_2.py`、`realsense_camera.py`、`robot_ik_solver.py`、`workspace_constraint.py`、`analytic_IK.py`、`collision_check.py`、相关 config、OpenArm URDF/SRDF，以及处理 `openarm_can` binding。
 
-如果只迁 Python 胶水而不处理 `openarm_can`、URDF/config、third-party `pyroki` 来源，代码表面上能 import，但真机 server 的 `/pose`、`/servo/*`、`/jointreset`、相机和 IK 都无法保证与依赖 `moqi_workspace` 时等价。
+如果只迁 Python 胶水而不处理 openarm_can、URDF/config、third-party pyroki 来源，代码表面上能 import，但真机 server 的控制入口、相机和 IK 都无法保证与依赖 moqi_workspace 时等价。当前重构后旧控制入口已移除，统一使用 control API。

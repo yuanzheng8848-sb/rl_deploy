@@ -769,156 +769,6 @@ class OpenArmServer:
             result["safety"] = diagnostics.get("safety", {})
         return result
 
-    def move_ik(self, target_pose_flat, duration=1, gripper_pos=None):
-        """Move in Cartesian space by solving IK, then commanding joints."""
-        if not self.ik_solver:
-            print("[Server] Cannot move_ik: No solver initialized.")
-            return False
-
-        # 1. 鑾峰彇褰撳墠鍏宠妭瑙掍綔?IK 杩唬鍒?
-        with self.lock:
-            q_l_curr, _ = self.controller.get_left_position()
-            q_r_curr, _ = self.controller.get_right_position()
-        
-        if q_l_curr is None: q_l_curr = np.zeros(7)
-        if q_r_curr is None: q_r_curr = np.zeros(7)
-        q_curr = np.concatenate([q_l_curr, q_r_curr])
-
-        # 2. 杞崲鐩爣鏍煎紡 (Env -> IK Solver)
-        # Env input: [px, py, pz, qx, qy, qz, qw]
-        # IK expects: [w, qx, qy, qz, px, py, pz] (鍋囪 robot_ik_solver 閬靛惊姝ょ害?
-        target_pose_input = np.array(target_pose_flat).reshape(2, 7)
-        target_ik = np.zeros((2, 7))
-        
-        for i in range(2):
-            pos = target_pose_input[i, :3]
-            quat = target_pose_input[i, 3:] # qx, qy, qz, qw
-            
-            target_ik[i, 0] = quat[3]   # w
-            target_ik[i, 1:4] = quat[0:3] # x, y, z
-            target_ik[i, 4:7] = pos     # px, py, pz
-
-        # 3. 姹傝В IK
-        q_target = self.ik_solver.solve_ik(target_ik, q_curr)
-        
-        if q_target is None or np.any(np.isnan(q_target)):
-            print("[Server] IK Solution Failed (NaN or None)")
-            return False
-
-        # 4. 鎵ц鍏宠妭绉诲姩 (骞虫粦)
-        return self.move_joints(q_target, duration=duration, gripper_pos=gripper_pos)
-
-    def move_joints(self, joints, duration=3, gripper_pos=None):
-        """Move both arms to a 14-dim joint target with optional smoothing."""
-            
-        try:
-            print(f"[Server] move_joints called with duration={duration}")
-            joints = np.array(joints)
-            if joints.shape != (14,):
-                print(f"[Server] Invalid joints shape: {joints.shape}")
-                return False
-                
-            left_target = joints[:7]
-            right_target = joints[7:]
-            print(f"[Server] Target Left: {left_target}")
-            print(f"[Server] Target Right: {right_target}")
-            
-            with self.lock:
-                # Reading current position (outside the loop, as start point for interpolation)
-                left_current, g_l_current = self.controller.get_left_position()
-                right_current, g_r_current = self.controller.get_right_position()
-
-                # Handle potential None values for current positions
-                if left_current is None: left_current = np.zeros(7)
-                if right_current is None: right_current = np.zeros(7)
-                if not g_l_current: g_l_current = [0.0]
-                if not g_r_current: g_r_current = [0.0]
-                
-                # Extract current gripper values
-                # If gripper_pos is provided, use it as target. Otherwise keep current.
-                if gripper_pos is not None:
-                    g_l_target = gripper_pos[0]
-                    g_r_target = gripper_pos[1]
-                else:
-                    g_l_target = g_l_current[0]
-                    g_r_target = g_r_current[0]
-
-                # Unified Smooth Movement Logic (for both Real and Mock)
-                start_time = time.time()
-                # Aim for ~50Hz update rate
-                steps = int(duration * 50) 
-                if steps == 0: steps = 1 # Ensure at least one step for very short durations
-                step_interval = duration / steps
-
-                if duration <= 0:
-                    # Direct Control Mode (No Smoothing)
-                    # Used for high-frequency control (e.g. RL step)
-                    
-                    # Send Command directly
-                    self.controller.set_left_position(left_target, g_l_target, left_current, g_l_current[0])
-                    self.controller.set_right_position(right_target, g_r_target, right_current, g_r_current[0])
-                    
-                    if self.viser:
-                        self.viser.update_joints(np.concatenate([left_target, right_target]))
-                        
-                    return True
-
-                # Smooth Movement Mode
-                print(f"[Server] Smooth move start: {duration}s, steps: {steps}")
-                
-                for i in range(steps + 1): # +1 to ensure target is reached at the end
-                    elapsed = time.time() - start_time
-                    progress = min(elapsed / duration, 1.0)
-                    
-                    # Smoothstep interpolation
-                    t = progress
-                    smooth_progress = t * t * (3.0 - 2.0 * t)
-
-                    # Interpolate joint commands
-                    left_cmd = left_current + (left_target - left_current) * smooth_progress
-                    right_cmd = right_current + (right_target - right_current) * smooth_progress
-                    
-                    # Interpolate gripper commands (if moving)
-                    # Note: Gripper usually moves fast, but smoothing is safer if duration is long.
-                    # If gripper_pos was not provided, g_l_target == g_l_current[0], so it stays still.
-                    g_l_cmd = g_l_current[0] + (g_l_target - g_l_current[0]) * smooth_progress
-                    g_r_cmd = g_r_current[0] + (g_r_target - g_r_current[0]) * smooth_progress
-                    
-                    # Get actual current state for set_position (PD control)
-                    # This ensures the PD controller has the most up-to-date feedback
-                    curr_l_real, g_l_real = self.controller.get_left_position()
-                    curr_r_real, g_r_real = self.controller.get_right_position()
-                    
-                    # Handle potential None values for real current positions
-                    if curr_l_real is None: curr_l_real = left_cmd # Fallback to command if read fails
-                    if curr_r_real is None: curr_r_real = right_cmd # Fallback to command if read fails
-                    if not g_l_real: g_l_real = g_l_current # Fallback to initial gripper if read fails
-                    if not g_r_real: g_r_real = g_r_current # Fallback to initial gripper if read fails
-
-                    # Send Command using set_position
-                    # We pass the interpolated `left_cmd`/`right_cmd` as the target.
-                    # We pass the actual `curr_l_real`/`curr_r_real` as current for PD calculation.
-                    self.controller.set_left_position(left_cmd, g_l_cmd, curr_l_real, g_l_real[0])
-                    self.controller.set_right_position(right_cmd, g_r_cmd, curr_r_real, g_r_real[0])
-                    
-                    # Update Viser with the interpolated command
-                    if self.viser:
-                        self.viser.update_joints(np.concatenate([left_cmd, right_cmd]))
-                        
-                    # Sleep to control update rate
-                    time_to_sleep = start_time + (i + 1) * step_interval - time.time()
-                    if time_to_sleep > 0:
-                        time.sleep(time_to_sleep)
-
-            return True
-        except Exception as e:
-            print(f"[Server] move_joints failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-
-
 # --- 瀹炰緥?Server ---
 server = OpenArmServer()
 
@@ -964,70 +814,6 @@ def route_motor_params_query():
         print(f"[API Error] motor_params/query: {e}")
         return str(e), 500
 
-@app.route("/pose", methods=["POST"])
-def route_pose():
-    """鎺ユ敹绗涘崱灏斾綅濮挎寚?-> IK -> 鍏宠妭鎺у埗"""
-    try:
-        arr = request.json.get("arr")
-        gripper = request.json.get("gripper") # Optional: [left, right]
-        duration = request.json.get("duration", 3)
-        if arr is None:
-            return "Missing array", 400
-        
-        if server.move_ik(arr, duration=duration, gripper_pos=gripper):
-            return "OK", 200
-        else:
-            return "IK Fail", 500
-    except Exception as e:
-        print(f"[API Error] pose: {e}")
-        return str(e), 500
-
-@app.route("/move_joints", methods=["POST"])
-def route_move_joints():
-    """鐩存帴鎺ユ敹鍏宠妭瑙掑害鎸囦护"""
-    try:
-        joints = request.json.get("joints")
-        gripper = request.json.get("gripper") # Optional: [left, right]
-        if joints is None:
-            return "Missing joints", 400
-            
-        if server.move_joints(joints, gripper_pos=gripper):
-            return "OK", 200
-        return "Fail", 500
-    except Exception as e:
-        print(f"[API Error] move_joints: {e}")
-        return str(e), 500
-
-
-@app.route("/servo/start", methods=["POST"])
-def route_servo_start():
-    try:
-        payload = request.json or {}
-        arr = payload.get("arr")
-        gripper = payload.get("gripper")
-        servo_hz = payload.get("servo_hz", 80.0)
-        trans_step = payload.get("trans_step", 0.012)
-        rot_step = payload.get("rot_step", 0.008)
-        gripper_step = payload.get("gripper_step", 0.02)
-        arm = payload.get("arm", "both")
-        backend = payload.get("backend", "baseik")
-        if server.start_servo(
-            arr,
-            gripper_pos=gripper,
-            servo_hz=servo_hz,
-            trans_step=trans_step,
-            rot_step=rot_step,
-            gripper_step=gripper_step,
-            arm=arm,
-            backend=backend,
-        ):
-            return "OK", 200
-        return "Servo Start Fail", 500
-    except Exception as e:
-        print(f"[API Error] servo/start: {e}")
-        return str(e), 500
-
-
 @app.route("/control/start", methods=["POST"])
 def route_control_start():
     try:
@@ -1054,22 +840,6 @@ def route_control_start():
         return jsonify({"ok": False, "error": "control start failed"}), 500
     except Exception as e:
         print(f"[API Error] control/start: {e}")
-        return str(e), 500
-
-
-@app.route("/servo/target", methods=["POST"])
-def route_servo_target():
-    try:
-        payload = request.json or {}
-        arr = payload.get("arr")
-        gripper = payload.get("gripper")
-        if arr is None:
-            return "Missing array", 400
-        if server.update_servo_target(arr, gripper_pos=gripper):
-            return "OK", 200
-        return "Servo Not Enabled", 409
-    except Exception as e:
-        print(f"[API Error] servo/target: {e}")
         return str(e), 500
 
 
@@ -1105,16 +875,6 @@ def route_control_target():
         return str(e), 500
 
 
-@app.route("/servo/stop", methods=["POST"])
-def route_servo_stop():
-    try:
-        server.stop_servo()
-        return "OK", 200
-    except Exception as e:
-        print(f"[API Error] servo/stop: {e}")
-        return str(e), 500
-
-
 @app.route("/control/stop", methods=["POST"])
 def route_control_stop():
     try:
@@ -1137,36 +897,27 @@ def route_control_home():
         payload = request.json or {}
         duration = float(payload.get("duration", 3.0))
         gripper = payload.get("gripper")
-        ok = server.move_joints(home_pos, duration=duration, gripper_pos=gripper)
-        return jsonify({"ok": bool(ok)}), 200 if ok else 409
+        servo_hz = float(payload.get("servo_hz", server.servo_hz))
+        dt = max(1.0 / servo_hz, 0.001)
+        deadline = time.time() + max(duration, dt)
+        server.stop_servo()
+        last_info = {}
+        ok = True
+        while time.time() < deadline:
+            with server.lock:
+                ok, last_info = server.controller.command_joint_target(
+                    home_pos,
+                    gripper_target=gripper,
+                    active_arms=(0, 1),
+                    dt=dt,
+                    source="control:home",
+                )
+            if not ok:
+                break
+            time.sleep(dt)
+        return jsonify({"ok": bool(ok), "info": last_info}), 200 if ok else 409
     except Exception as e:
         print(f"[API Error] control/home: {e}")
-        return str(e), 500
-
-
-
-@app.route("/jointreset", methods=["POST"])
-def route_reset():
-    """Move the robot to the configured home pose at episode boundaries."""
-    try:
-        # 瀹氫箟涓€涓畨鍏ㄧ殑 Home 浣嶇疆 (寮у害)
-        # 杩欓噷?14缁存暟缁勯渶瑕佹牴鎹疄闄呮満鍣ㄤ汉?"Zero" 濮挎€佽皟?
-        # 鍙?Controller 2.0 涓殑 target
-        # Updated Home Position from openarm_controller_2.py
-        # Left Arm (0-6)
-        home_pos_l = [-0.166811, -0.497863 , 0.635447, 1.499999, -0.627859, 0.507960, -0.168161]
-        # Right Arm (7-13)
-        home_pos_r = [0.166811, 0.497863, -0.635447, 1.499999, 0.627859, -0.507960, 0.168161]
-        home_pos = np.concatenate([home_pos_l, home_pos_r])
-        
-        # 浣跨敤 controller 鑷甫鐨勫钩婊戠Щ鍔ㄦ洿濂斤紝浣嗛偅鏄樆濉炵殑?
-        # 鏃㈢劧?Reset锛岄樆濉炰竴涓嬩篃娌″叧绯?
-        # 鎴栬€呯洿鎺ヨ皟?move_joints (闈炲钩婊戯紝鐩存帴 PID)
-        server.move_joints(home_pos, duration=3)
-        
-        return "OK", 200
-    except Exception as e:
-        print(f"[API Error] reset: {e}")
         return str(e), 500
 
 if __name__ == "__main__":
