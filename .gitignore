@@ -3,9 +3,9 @@
 # ----------------------------
 .vscode/
 .idea/
-#.claude/
+.claude/
 .codex/
-#.agents/
+.agents/
 *.swp
 *.swo
 *~
