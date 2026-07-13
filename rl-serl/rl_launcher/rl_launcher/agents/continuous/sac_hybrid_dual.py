@@ -239,7 +239,7 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         grasp_action2 = jnp.round(batch["actions"][..., 13]).astype(jnp.int16) + 1  # Cast env action from [-1, 1] to {0, 1, 2}
         
         # Combine the two grasp actions into a single joint action ranging from 0 to 8
-        joint_grasp_action = grasp_action1 * 3 + grasp_action2  # 0 â‰?joint_grasp_action < 9
+        joint_grasp_action = grasp_action1 * 3 + grasp_action2  # 0 â‰¤joint_grasp_action < 9
         # Ensure joint actions are within the valid range
         chex.assert_shape(joint_grasp_action, (batch_size,))
         
