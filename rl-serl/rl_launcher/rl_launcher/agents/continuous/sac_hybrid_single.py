@@ -256,9 +256,8 @@ class SACAgentHybridSingleArm(flax.struct.PyTreeNode):
         chex.assert_shape(target_next_grasp_q, (batch_size,))
 
         # Compute target Q-values
-        grasp_rewards = batch["rewards"] + batch["grasp_penalty"]
         target_grasp_q = (
-            grasp_rewards
+            batch["rewards"]
             + self.config["discount"] * batch["masks"] * target_next_grasp_q
         )
         chex.assert_shape(target_grasp_q, (batch_size,))
@@ -283,7 +282,7 @@ class SACAgentHybridSingleArm(flax.struct.PyTreeNode):
             "grasp_critic_loss": grasp_critic_loss,
             "predicted_grasp_qs": jnp.mean(predicted_grasp_q),
             "target_grasp_qs": jnp.mean(target_grasp_q),
-            "grasp_rewards": grasp_rewards.mean(),
+            "grasp_critic_rewards": batch["rewards"].mean(),
         }
 
         return grasp_critic_loss, info

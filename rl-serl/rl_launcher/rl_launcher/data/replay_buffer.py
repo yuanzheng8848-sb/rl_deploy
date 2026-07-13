@@ -33,6 +33,22 @@ def _insert_recursively(
         raise TypeError()
 
 
+def _validate_structure(dataset_dict: DatasetDict, data_dict: DatasetDict, path="transition"):
+    """Reject missing and extra fields instead of silently discarding either."""
+    if isinstance(dataset_dict, np.ndarray):
+        return
+    if not isinstance(data_dict, dict):
+        raise TypeError(f"{path} must be a dict")
+    expected = set(dataset_dict)
+    actual = set(data_dict)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(f"{path} fields mismatch: missing={missing}, extra={extra}")
+    for key, value in dataset_dict.items():
+        _validate_structure(value, data_dict[key], f"{path}.{key}")
+
+
 class ReplayBuffer(Dataset):
     def __init__(
         self,
@@ -42,7 +58,6 @@ class ReplayBuffer(Dataset):
         next_observation_space: Optional[gym.Space] = None,
         include_next_actions: Optional[bool] = False,
         include_label: Optional[bool] = False,
-        include_grasp_penalty: Optional[bool] = False,
     ):
         if next_observation_space is None:
             next_observation_space = observation_space
@@ -65,9 +80,6 @@ class ReplayBuffer(Dataset):
         if include_label:
             dataset_dict['labels'] = np.empty((capacity,), dtype=int)
         
-        if include_grasp_penalty:
-            dataset_dict['grasp_penalty'] = np.empty((capacity,), dtype=np.float32)
-
         super().__init__(dataset_dict)
 
         self._size = 0
@@ -78,6 +90,7 @@ class ReplayBuffer(Dataset):
         return self._size
 
     def insert(self, data_dict: DatasetDict):
+        _validate_structure(self.dataset_dict, data_dict)
         _insert_recursively(self.dataset_dict, data_dict, self._insert_index)
 
         self._insert_index = (self._insert_index + 1) % self._capacity

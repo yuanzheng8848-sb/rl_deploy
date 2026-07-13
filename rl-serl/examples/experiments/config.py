@@ -16,7 +16,9 @@ class DefaultTrainingConfig:
     agent: str = "sac"
     setup_mode: str = "dual-arm-learned-gripper"
 
-    max_traj_length: int = 400
+    # Environment transitions run at 20 Hz; episode duration is expressed in
+    # seconds so changing the rate does not silently change task duration.
+    max_episode_seconds: float = 80.0
     batch_size: int = 256
     discount: float = 0.97
     critic_actor_ratio: int = 4
@@ -24,7 +26,8 @@ class DefaultTrainingConfig:
     max_steps: int = 100000
     replay_buffer_capacity: int = 50000
 
-    random_steps: int = 50
+    # Preserve ten seconds of random exploration at the policy transition rate.
+    random_steps: int = 200
     training_starts: int = 300
     steps_per_update: int = 50
 
@@ -32,7 +35,8 @@ class DefaultTrainingConfig:
     checkpoint_period: int = 200
 
     encoder_type: str = "resnet-pretrained"
-    hz: int = 5
+    hz: int = 20
+    teleop_control_hz: int = 80
 
     # image / proprio keys
     image_keys: List[str] = None       # streams fed to the policy encoder
@@ -90,8 +94,8 @@ class DefaultTrainingConfig:
             # Ensure scalar for int() conversion: (1, 1) or (1,) -> scalar.
             if logits.ndim > 0:
                 logits = logits.squeeze()
-            prob = sigmoid(logits)
-            return int(prob > threshold)
+            prob = float(jnp.asarray(sigmoid(logits)))
+            return int(prob > threshold), prob
 
         return reward_func
 

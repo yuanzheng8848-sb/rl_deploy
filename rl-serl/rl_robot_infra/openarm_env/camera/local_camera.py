@@ -1,33 +1,19 @@
 """Local camera construction for OpenArm environments."""
 
+from pathlib import Path
+
+import yaml
+
 from openarm_env.camera.camera_factory import build_camera
+from openarm_env.mock_hardware import MockCamera
 
 
 MODEL_IMAGE_SIZE = (128, 128)
 
-_DEFAULT_CAMERA_CONFIGS = {
-    "local-head": {
-        "name": "head",
-        "type": "usb",
-        "width": 640,
-        "height": 480,
-        "fps": 30,
-        "env_device_id": "OPENARM_HEAD_CAMERA_DEVICE",
-    },
-    "local-left": {
-        "name": "left",
-        "type": "realsense",
-        "width": 640,
-        "height": 480,
-        "fps": 30,
-    },
-    "local-right": {
-        "name": "right",
-        "type": "realsense",
-        "width": 640,
-        "height": 480,
-        "fps": 30,
-    },
+DEPLOYMENT_IMAGE_KEYS = {
+    "head": "image_primary",
+    "left": "image_left",
+    "right": "image_right",
 }
 
 
@@ -36,22 +22,27 @@ def resolve_camera_config(camera_ref):
         cfg = dict(camera_ref)
         cfg.setdefault("name", cfg.get("id", "camera"))
         return cfg
-    if isinstance(camera_ref, str):
-        if camera_ref not in _DEFAULT_CAMERA_CONFIGS:
-            raise ValueError(f"Unknown camera ref {camera_ref!r}")
-        return dict(_DEFAULT_CAMERA_CONFIGS[camera_ref])
-    raise TypeError(f"Camera config must be a dict or known camera ref, got {camera_ref!r}")
+    raise TypeError(f"Camera config must be an explicit mapping, got {camera_ref!r}")
+
+
+def load_deployment_camera_config(path=None):
+    config_path = (
+        Path(path)
+        if path is not None
+        else Path(__file__).resolve().parents[2] / "openarm_configs" / "cameras.yaml"
+    )
+    with open(config_path, encoding="utf-8") as handle:
+        hardware_config = yaml.safe_load(handle) or {}
+    return {
+        image_key: {"name": hardware_name, **dict(hardware_config[hardware_name])}
+        for hardware_name, image_key in DEPLOYMENT_IMAGE_KEYS.items()
+    }
 
 
 def build_cameras(camera_config, virtual=False):
-    """Construct (image_key, camera) pairs from EnvConfig.REALSENSE_CAMERAS only."""
+    """Construct explicit (image_key, camera) pairs from deployment config."""
     if not isinstance(camera_config, dict):
         raise TypeError("camera_config must be a dict mapping image keys to camera configs")
-
-    try:
-        from openarm_env.mock_hardware import MockCamera
-    except Exception:
-        MockCamera = None
 
     cameras = []
     seen = set()

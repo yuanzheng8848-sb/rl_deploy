@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from data_contract import to_replay_transition, validate_transition
+
 
 GRIPPER_ACTION_INDICES = (6, 13)
 CONTINUOUS_ACTION_INDICES = tuple(i for i in range(14) if i not in GRIPPER_ACTION_INDICES)
@@ -56,24 +58,24 @@ def load_trajectories(dir_path, max_trajs=0):
         with open(path, "rb") as handle:
             traj = pkl.load(handle)
         if isinstance(traj, list):
+            for idx, transition in enumerate(traj):
+                validate_transition(transition, source=f"{path}[{idx}]")
             trajectories.append((Path(path), traj))
     return trajectories
 
 
 def prepare_transition(transition, skip_zero_action=False):
+    validate_transition(transition)
     action = np.asarray(transition.get("actions"), dtype=np.float32)
     if action.shape[-1] != 14:
         return None
     if skip_zero_action and float(np.linalg.norm(action)) == 0.0:
         return None
-    prepared = copy.deepcopy(transition)
+    prepared = to_replay_transition(transition)
     prepared["actions"] = action
     prepared["rewards"] = np.asarray(prepared.get("rewards", 0.0), dtype=np.float32)
     prepared["masks"] = np.asarray(prepared.get("masks", 1.0), dtype=np.float32)
     prepared["dones"] = bool(prepared.get("dones", False))
-    prepared["grasp_penalty"] = np.asarray(
-        prepared.get("grasp_penalty", 0.0), dtype=np.float32
-    )
     return prepared
 
 

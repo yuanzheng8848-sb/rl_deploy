@@ -19,6 +19,7 @@ import gymnasium as gym
 import jax
 import matplotlib.pyplot as plt
 import numpy as np
+from data_contract import validate_transition
 import optax
 import pandas as pd
 from absl import app, flags
@@ -125,6 +126,8 @@ def extract_traj_images(traj, image_key, frame_count=None, take_from="tail"):
     images = []
     if not isinstance(traj, list):
         return images
+    for idx, transition in enumerate(traj):
+        validate_transition(transition, source=f"classifier trajectory[{idx}]")
 
     if take_from == "tail":
         selected = traj[-frame_count:] if frame_count and frame_count > 0 else traj

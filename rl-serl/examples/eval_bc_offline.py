@@ -564,7 +564,7 @@ def _stack_xyz(seq):
     return out
 
 
-def _one_step_action_xyz(actions, tcp_path, action_scale: float = 0.01):
+def _one_step_action_xyz(actions, tcp_path, action_scale: float = 0.0025):
     """Map each action to a one-step TCP endpoint from the matching real TCP pose."""
     actions = np.asarray(actions, dtype=np.float32)
     tcp_path = np.asarray(tcp_path, dtype=np.float32)
@@ -578,7 +578,7 @@ def _one_step_action_xyz(actions, tcp_path, action_scale: float = 0.01):
     return eval_path
 
 
-def _step_error(actions, tcp_path, action_scale: float = 0.01):
+def _step_error(actions, tcp_path, action_scale: float = 0.0025):
     """Return one-step TCP endpoint MSE and last-step error."""
     actions = np.asarray(actions, dtype=np.float32)
     tcp_path = np.asarray(tcp_path, dtype=np.float32)
@@ -597,7 +597,7 @@ def _step_error(actions, tcp_path, action_scale: float = 0.01):
     return mse, last_error
 
 
-def _step_metric_arrays(actions, tcp_path, action_scale: float = 0.01, moving_threshold=None):
+def _step_metric_arrays(actions, tcp_path, action_scale: float = 0.0025, moving_threshold=None):
     """Return per-action one-step displacement diagnostics."""
     actions = np.asarray(actions, dtype=np.float32)
     tcp_path = np.asarray(tcp_path, dtype=np.float32)
@@ -736,7 +736,7 @@ def _xyz_mse(a, b):
 
 
 def _plot_step_action_trajectory(ax, pred_actions, tcp_path, title,
-                                 action_scale: float = 0.01):
+                                 action_scale: float = 0.0025):
     """Plot real TCP trajectory against one-step eval TCP endpoints.
 
     Real trajectory is the ground-truth tcp_pose from observations. Eval trajectory
@@ -747,7 +747,7 @@ def _plot_step_action_trajectory(ax, pred_actions, tcp_path, title,
         pred_actions: (N, 3) predicted action xyz
         tcp_path: (N, 3) ground-truth tcp_pose xyz per frame
         title: subplot title
-        action_scale: env ACTION_SCALE[0], default 0.01 m per unit
+        action_scale: ACTION_VELOCITY_SCALE[0] / policy_hz, default 0.0025 m
     """
     if pred_actions.shape[0] < 2 or tcp_path.shape[0] < 2:
         ax.set_title(f"{title}\n(insufficient data)", fontsize=10)

@@ -54,6 +54,8 @@ import tqdm
 from absl import app, flags
 from flax.training import checkpoints
 
+from data_contract import stamp_transition, to_replay_transition, validate_transition
+
 import jax
 import jax.numpy as jnp
 
@@ -63,7 +65,6 @@ from rl_launcher.utils.launcher import (
     make_wandb_logger,
 )
 from rl_launcher.data import MemoryEfficientReplayBufferDataStore, QueuedDataStore
-from rl_launcher.networks import load_classifier_func
 from rl_launcher.utils import Timer, concat_batches, TrainerClient, TrainerServer
 
 from experiments.artifacts import task_bc_checkpoint_dir, task_rlpd_checkpoint_dir, task_success_dir
@@ -187,9 +188,9 @@ def load_transition_dir(dir_path, data_store):
         with open(path, "rb") as handle:
             transitions = pkl.load(handle)
         loaded_files += 1
-        for transition in transitions:
-            transition.setdefault("grasp_penalty", np.asarray(0.0, dtype=np.float32))
-            data_store.insert(transition)
+        for idx, transition in enumerate(transitions):
+            validate_transition(transition, source=f"{path}[{idx}]")
+            data_store.insert(to_replay_transition(transition))
             loaded_transitions += 1
     return loaded_files, loaded_transitions
 
@@ -217,9 +218,9 @@ def load_transition_files(paths, data_store):
         with open(norm, "rb") as handle:
             transitions = pkl.load(handle)
         loaded_files += 1
-        for transition in transitions:
-            transition.setdefault("grasp_penalty", np.asarray(0.0, dtype=np.float32))
-            data_store.insert(transition)
+        for idx, transition in enumerate(transitions):
+            validate_transition(transition, source=f"{norm}[{idx}]")
+            data_store.insert(to_replay_transition(transition))
             loaded_transitions += 1
     return loaded_files, loaded_transitions
 
@@ -248,7 +249,7 @@ def is_intervention_mode_active(env):
     from openarm_env.envs.wrappers import DualSpacemouseIntervention
 
     wrapper = find_wrapper(env, DualSpacemouseIntervention)
-    return bool(wrapper is not None and wrapper._intervention_mode)
+    return bool(wrapper is not None and wrapper.intervention_active)
 
 
 def image_from_obs(obs, key):
@@ -261,33 +262,6 @@ def image_from_obs(obs, key):
     if img.ndim != 3 or img.shape[-1] != 3:
         return None
     return img.astype(np.uint8)
-
-
-def make_classifier_reference(config, env):
-    classifier_keys = list(getattr(config, "classifier_keys", []) or [])
-    checkpoint_path = getattr(config, "classifier_ckpt_path", None)
-    if not classifier_keys or not checkpoint_path:
-        print_yellow("classifier reference disabled: missing classifier_keys or checkpoint path.")
-        return None, 0.0
-    checkpoint_path = os.path.abspath(checkpoint_path)
-    if not os.path.exists(checkpoint_path):
-        print_yellow(f"classifier reference disabled: checkpoint path not found: {checkpoint_path}")
-        return None, 0.0
-
-    classifier_logits = load_classifier_func(
-        key=jax.random.PRNGKey(0),
-        sample=env.observation_space.sample(),
-        image_keys=classifier_keys,
-        checkpoint_path=checkpoint_path,
-    )
-    threshold = float(getattr(config, "classifier_threshold", 0.5))
-
-    def classifier_prob(obs):
-        logits = classifier_logits(obs)
-        prob = jax.nn.sigmoid(jnp.squeeze(logits))
-        return float(np.asarray(jax.device_get(prob)))
-
-    return classifier_prob, threshold
 
 
 def render_actor_feedback(obs, image_keys, reward, classifier_prob, classifier_threshold, done):
@@ -392,7 +366,7 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
         evaluate(agent, env, sampling_rng, checkpoint_path)
         return
 
-    classifier_prob_fn, classifier_threshold = make_classifier_reference(config, env)
+    classifier_threshold = float(getattr(config, "classifier_threshold", 0.5))
     max_steps = _cfg_value(config, "max_steps", FLAGS.max_steps)
     start_step = 0
     buffer_dir = os.path.join(checkpoint_path, "buffer") if checkpoint_path else None
@@ -451,12 +425,12 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
             with timer.context("step_env"):
                 next_obs, reward, done, truncated, info = env.step(actions)
                 info = dict(info) if isinstance(info, dict) else {}
-                sampled_transition = info.get("sampled_transition")
+                intervention_transition = info.get("intervention_transition")
 
                 if info.get("intervention_idle", False):
-                    classifier_prob = classifier_prob_fn(obs) if classifier_prob_fn is not None else 0.0
+                    classifier_prob = float(info.get("classifier_prob", 0.0))
                     render_label = render_actor_feedback(
-                        obs,
+                        next_obs,
                         config.image_keys,
                         0.0,
                         classifier_prob,
@@ -471,7 +445,7 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                         last_timer_stats_step = step
                     continue
 
-                classifier_prob = classifier_prob_fn(next_obs) if classifier_prob_fn is not None else 0.0
+                classifier_prob = float(info.get("classifier_prob", 0.0))
                 render_label = render_actor_feedback(
                     next_obs,
                     config.image_keys,
@@ -493,18 +467,16 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                 else:
                     already_intervened = False
 
-                if sampled_transition is not None:
+                if intervention_transition is not None:
                     transition = {
-                        "observations": sampled_transition["observations"],
-                        "actions": np.asarray(sampled_transition["actions"], dtype=np.float32),
-                        "next_observations": sampled_transition["next_observations"],
+                        "observations": intervention_transition["observations"],
+                        "actions": np.asarray(intervention_transition["actions"], dtype=np.float32),
+                        "next_observations": intervention_transition["next_observations"],
                         "rewards": np.asarray(reward, dtype=np.float32),
                         "masks": np.asarray(
                             1.0 - float(done), dtype=np.float32
                         ),
                         "dones": bool(done),
-                        "truncated": bool(truncated),
-                        "infos": copy.deepcopy(sampled_transition.get("infos", info)),
                     }
                     reward = transition["rewards"]
                     done = transition["dones"]
@@ -517,26 +489,13 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                         "rewards": np.asarray(reward, dtype=np.float32),
                         "masks": np.asarray(1.0 - float(done), dtype=np.float32),
                         "dones": bool(done),
-                        "truncated": bool(truncated),
-                        "infos": copy.deepcopy(info),
                     }
 
-                transition["infos"] = copy.deepcopy(transition["infos"])
-                transition["infos"]["classifier_prob"] = float(classifier_prob)
-                transition["infos"]["classifier_threshold"] = float(classifier_threshold)
-                transition["infos"]["classifier_reference_success"] = bool(
-                    classifier_prob > classifier_threshold
-                )
-
-                transition["grasp_penalty"] = np.asarray(
-                    info.get("grasp_penalty", 0.0), dtype=np.float32
-                )
-
                 data_store.insert(transition)
-                transitions.append(transition.copy())
+                transitions.append(stamp_transition(transition))
                 if intervened:
                     intvn_data_store.insert(transition)
-                    demo_transitions.append(transition.copy())
+                    demo_transitions.append(stamp_transition(transition))
 
                 obs = next_obs
                 running_return += float(np.asarray(reward))
@@ -552,9 +511,6 @@ def actor(config, agent, data_store, intvn_data_store, env, sampling_rng, checkp
                     info["episode"]["intervention_count"] = intervention_count
                     info["episode"]["intervention_steps"] = intervention_steps
                     info["episode"]["classifier_prob"] = float(classifier_prob)
-                    info["episode"]["classifier_reference_success"] = bool(
-                        classifier_prob > classifier_threshold
-                    )
                     client.request("send-stats", {"environment": info})
                     running_return = 0.0
                     episode_len = 0
@@ -742,14 +698,12 @@ def main(_):
             env.action_space,
             capacity=config.replay_buffer_capacity,
             image_keys=config.image_keys,
-            include_grasp_penalty=True,
         )
         demo_buffer = MemoryEfficientReplayBufferDataStore(
             env.observation_space,
             env.action_space,
             capacity=config.replay_buffer_capacity,
             image_keys=config.image_keys,
-            include_grasp_penalty=True,
         )
         if checkpoint_path:
             files, transitions = load_transition_dir(os.path.join(checkpoint_path, "buffer"), replay_buffer)

@@ -1,0 +1,21 @@
+# Hardware calibration and network-independent control parameters.
+# Motor positions below are the only place where raw gripper units appear.
+servo:
+  backend: analytic
+  hz: 100.0
+  translation_step: 0.004
+  rotation_step: 0.012
+  gripper_step: 0.05
+  timeout: 0.25
+
+home:
+  joint_position:
+    [-0.166811, -0.497863, 0.635447, 1.499999, -0.627859, 0.507960, -0.168161,
+      0.166811,  0.497863, -0.635447, 1.499999,  0.627859, -0.507960,  0.168161]
+
+gripper:
+  open_position: [-1.0, -1.0]
+  closed_position: [0.05, 0.05]
+  # Hysteresis thresholds in raw motor position units. Calibrate per robot.
+  open_threshold: [-0.65, -0.65]
+  close_threshold: [-0.30, -0.30]

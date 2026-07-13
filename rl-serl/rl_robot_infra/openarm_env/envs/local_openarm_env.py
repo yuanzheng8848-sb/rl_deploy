@@ -26,27 +26,14 @@ class LocalOpenArmEnv(OpenArmEnv):
         while not self.stop_event.is_set():
             for name, cam in self.cameras:
                 try:
-                    frame = cam.get_data(viz=False)
-                    is_realsense = isinstance(frame, (list, tuple))
-                    if is_realsense:
-                        frame = frame[0]
-                    if frame is None:
+                    full_rgb = cam.read_rgb(viz=False)
+                    if full_rgb is None:
                         continue
-
-                    if is_realsense:
-                        full_rgb = frame
-                    else:
-                        full_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # Keep raw frames as the camera produced them. Network-view
-                    # cropping is owned by NetworkPrimaryImageCropWrapper.
+                    # Keep full-resolution RGB frames. Network-view cropping is
+                    # owned by NetworkPrimaryImageCropWrapper.
                     self.latest_images_raw[name] = full_rgb
 
-                    resized = cv2.resize(frame, MODEL_IMAGE_SIZE)
-                    if is_realsense:
-                        rgb = resized
-                    else:
-                        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                    self.latest_images[name] = rgb
+                    self.latest_images[name] = cv2.resize(full_rgb, MODEL_IMAGE_SIZE)
                 except Exception as exc:
                     print(f"[Capture Error:{name}] {exc}")
             time.sleep(0.01)

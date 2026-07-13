@@ -4,8 +4,8 @@
 Demos are collected with the task config's
 get_environment(env_mode="real", classifier=False), which
 includes the DualSpacemouseIntervention wrapper. ENTER/SPACE save trajectories
-into success/failure directories for classifier dataset construction; they do
-not write rewards.
+into success/failure directories. Successful trajectories use the same sparse
+terminal reward semantics as online RLPD.
 """
 import project_paths  # noqa: F401  (sets local package paths; must be first)
 
@@ -29,6 +29,7 @@ from experiments.artifacts import (
     task_success_dir,
 )
 from experiments.mappings import CONFIG_MAPPING
+from data_contract import finalize_labeled_trajectory
 
 
 def find_wrapper(env, class_name: str):
@@ -71,24 +72,6 @@ def parse_args():
         type=int,
         default=2,
         help="Discard trajectories with fewer than this many transitions.",
-    )
-    parser.add_argument(
-        "--teleop-control-hz",
-        type=float,
-        default=20.0,
-        help=(
-            "Recorder-side DualSpacemouseIntervention loop rate. Lower values improve "
-            "action/next_observation consistency by giving the servo time to move."
-        ),
-    )
-    parser.add_argument(
-        "--transition-sample-delay",
-        type=float,
-        default=0.05,
-        help=(
-            "Seconds to wait after sending a servo target before sampling next_observation. "
-            "Set 0 to keep the old immediate-sampling behavior."
-        ),
     )
     return parser.parse_args()
 
@@ -192,18 +175,6 @@ def save_trajectory(target_dir: Path, raw_target_dir: Path, trajectory, raw_fram
     return file_path
 
 
-def finalize_trajectory(trajectory):
-    if not trajectory:
-        return trajectory
-    finalized = [copy.deepcopy(transition) for transition in trajectory]
-    for transition in finalized:
-        transition["rewards"] = np.asarray(0.0, dtype=np.float32)
-        transition["masks"] = np.asarray(1.0, dtype=np.float32)
-        transition["dones"] = False
-        transition["truncated"] = False
-    return finalized
-
-
 def main():
     args = parse_args()
     if args.exp_name not in CONFIG_MAPPING:
@@ -218,12 +189,10 @@ def main():
     env = config.get_environment(env_mode="real", classifier=False)
     teleop_wrapper = find_wrapper(env, "DualSpacemouseIntervention")
     if teleop_wrapper is not None:
-        teleop_wrapper.control_hz = float(args.teleop_control_hz)
-        teleop_wrapper.transition_sample_delay = float(args.transition_sample_delay)
         print(
             "[Recorder] teleop timing: "
             f"control_hz={teleop_wrapper.control_hz:.2f}, "
-            f"transition_sample_delay={teleop_wrapper.transition_sample_delay:.3f}s"
+            f"transition_hz={env.unwrapped.hz:.2f}"
         )
     else:
         print("[Recorder] warning: DualSpacemouseIntervention wrapper not found.")
@@ -258,7 +227,7 @@ def main():
                     print(f"[Recorder] trajectory too short ({len(current_trajectory)}), discarded.")
                 else:
                     success = label == "success"
-                    finalized = finalize_trajectory(current_trajectory)
+                    finalized = finalize_labeled_trajectory(current_trajectory, label)
                     save_trajectory(
                         dirs["success"] if success else dirs["failure"],
                         dirs["raw_success"] if success else dirs["raw_failure"],
@@ -278,28 +247,15 @@ def main():
             if isinstance(info, dict) and info.get("intervention_idle", False):
                 continue
 
-            sampled_transition = info.get("sampled_transition") if isinstance(info, dict) else None
-            if sampled_transition is not None:
+            intervention_transition = info.get("intervention_transition") if isinstance(info, dict) else None
+            if intervention_transition is not None:
                 transition = {
-                    "observations": sampled_transition["observations"],
-                    "actions": np.asarray(sampled_transition["actions"], dtype=np.float32),
-                    "next_observations": sampled_transition["next_observations"],
-                    "rewards": np.asarray(sampled_transition["rewards"], dtype=np.float32),
-                    "masks": np.asarray(1.0 - float(sampled_transition["dones"]), dtype=np.float32),
-                    "dones": bool(sampled_transition["dones"]),
-                    "truncated": bool(sampled_transition.get("truncated", False)),
-                    "infos": copy.deepcopy(sampled_transition.get("infos", info)),
-                }
-            elif "intervene_action" in info:
-                transition = {
-                    "observations": obs,
-                    "actions": np.asarray(info["intervene_action"], dtype=np.float32),
-                    "next_observations": next_obs,
+                    "observations": intervention_transition["observations"],
+                    "actions": np.asarray(intervention_transition["actions"], dtype=np.float32),
+                    "next_observations": intervention_transition["next_observations"],
                     "rewards": np.asarray(reward, dtype=np.float32),
                     "masks": np.asarray(1.0 - float(done), dtype=np.float32),
                     "dones": bool(done),
-                    "truncated": bool(truncated),
-                    "infos": copy.deepcopy(info),
                 }
             else:
                 obs = next_obs
@@ -307,10 +263,6 @@ def main():
                     obs, _ = env.reset()
                 continue
 
-            transition["grasp_penalty"] = np.asarray(
-                info.get("grasp_penalty", 0.0) if isinstance(info, dict) else 0.0,
-                dtype=np.float32,
-            )
             current_trajectory.append(copy.deepcopy(transition))
             obs = next_obs
             current_raw_frames.append(snapshot_raw_images(env))

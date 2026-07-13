@@ -9,12 +9,10 @@ from pathlib import Path
 
 import cv2
 import jax
-import jax.numpy as jnp
 import numpy as np
 from absl import app, flags
 from flax.training import checkpoints
 
-from rl_launcher.networks import load_classifier_func
 from rl_launcher.utils.launcher import make_sac_pixel_agent_hybrid_dual_arm
 
 from bc_utils import action_vector
@@ -88,30 +86,6 @@ def image_from_obs(obs, key):
     return img.astype(np.uint8)
 
 
-def make_classifier_prob(config, env):
-    classifier_keys = list(getattr(config, "classifier_keys", []) or [])
-    checkpoint_path = getattr(config, "classifier_ckpt_path", None)
-    if not classifier_keys or not checkpoint_path:
-        return None, 0.0
-    checkpoint_path = os.path.abspath(checkpoint_path)
-    if not os.path.exists(checkpoint_path):
-        return None, 0.0
-    classifier_logits = load_classifier_func(
-        key=jax.random.PRNGKey(0),
-        sample=env.observation_space.sample(),
-        image_keys=classifier_keys,
-        checkpoint_path=checkpoint_path,
-    )
-    threshold = float(getattr(config, "classifier_threshold", 0.5))
-
-    def classifier_prob(obs):
-        logits = classifier_logits(obs)
-        prob = jax.nn.sigmoid(jnp.squeeze(logits))
-        return float(np.asarray(jax.device_get(prob)))
-
-    return classifier_prob, threshold
-
-
 def render_feedback(obs, image_keys, prob, threshold, reward, done, info):
     if not FLAGS.render:
         return None
@@ -150,7 +124,7 @@ def main(_):
 
     env = config.get_environment(env_mode="real", classifier=True)
     agent = restore_agent(create_agent(config, env), checkpoint_path)
-    classifier_prob_fn, classifier_threshold = make_classifier_prob(config, env)
+    classifier_threshold = float(getattr(config, "classifier_threshold", 0.5))
     rng = jax.random.PRNGKey(FLAGS.seed)
 
     episode_rows = []
@@ -180,7 +154,7 @@ def main(_):
                 action = np.asarray(jax.device_get(action))
                 next_obs, reward, done, truncated, info = env.step(action)
                 info = info if isinstance(info, dict) else {}
-                prob = classifier_prob_fn(next_obs) if classifier_prob_fn is not None else 0.0
+                prob = float(info.get("classifier_prob", 0.0))
                 render_label = render_feedback(
                     next_obs,
                     config.image_keys,
@@ -209,8 +183,6 @@ def main(_):
                         "done": int(done),
                         "truncated": int(truncated),
                         "classifier_prob": prob,
-                        "classifier_threshold": classifier_threshold,
-                        "classifier_reference_success": int(prob > classifier_threshold),
                         "succeed": int(bool(info.get("succeed", False))),
                         "action_norm": action_norm,
                         "gripper_left": gripper[0],

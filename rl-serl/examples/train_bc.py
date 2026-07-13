@@ -373,7 +373,6 @@ def main(_):
         env.action_space,
         capacity=config.replay_buffer_capacity,
         image_keys=config.image_keys,
-        include_grasp_penalty=True,
     )
     files, transitions, skipped = load_demo_dir_into_buffer(
         success_dir,

@@ -9,15 +9,13 @@ import gymnasium as gym
 from scipy.spatial.transform import Rotation as R
 
 from openarm_env.utils.transformations import (
-    construct_adjoint_matrix,
     construct_homogeneous_matrix,
+    construct_twist_rotation_matrix,
 )
-from rl_launcher.wrappers import ChunkingWrapper, SERLObsWrapper
+from rl_launcher.wrappers import ChunkingWrapper
+from rl_launcher.wrappers.chunking import stack_obs
 
-from openarm_env.envs.openarm_env import (
-    apply_binary_gripper_logic,
-    get_gripper_thresholds,
-)
+from openarm_env.envs.openarm_env import integrate_pose_velocity
 from openarm_env.camera.local_camera import MODEL_IMAGE_SIZE
 
 try:
@@ -27,18 +25,13 @@ except Exception:  # pragma: no cover - evdev/hardware dependent
     ecodes = None
 
 
-# ---------------------------------------------------------------------------
-# Observation stacking helper.
-# ---------------------------------------------------------------------------
-def stack_obs(obs):
-    import jax
-
-    dict_list = {key: [item[key] for item in obs] for key in obs[0]}
-    return jax.tree_util.tree_map(
-        lambda values: np.stack(values),
-        dict_list,
-        is_leaf=lambda value: isinstance(value, list),
-    )
+def consume_intervention_toggle_requests(device_states):
+    """Merge one polling round's toggle requests and clear every device flag."""
+    requests = [
+        bool(state.pop("intervention_toggle_requested", False))
+        for state in device_states
+    ]
+    return any(requests)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +48,8 @@ def crop_rgb_image(img, crop_ratio, y_offset_ratio=0.0):
             crop_rgb_image(frame, crop_ratio, y_offset_ratio=y_offset_ratio)
             for frame in flat
         ]
-        return np.stack(cropped, axis=0).reshape((*leading_shape, *MODEL_IMAGE_SIZE[::-1], 3))
+        stacked = np.stack(cropped, axis=0)
+        return stacked.reshape((*leading_shape, *stacked.shape[1:]))
 
     ratio = float(np.clip(crop_ratio, 0.05, 1.0))
     y_offset_ratio = float(np.clip(y_offset_ratio, -0.5, 0.5))
@@ -95,65 +89,31 @@ def crop_primary_image_for_network(
     return obs
 
 
-# ---------------------------------------------------------------------------
-# Grasp penalty helpers.
-# ---------------------------------------------------------------------------
-def compute_grasp_penalty(action, last_binary_state, penalty, open_threshold, close_threshold):
-    action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.size < 14:
-        return np.asarray(0.0, dtype=np.float32)
-
-    penalty_value = 0.0
-    for arm_idx, gripper_idx in enumerate((6, 13)):
-        last_state = int(last_binary_state[arm_idx])
-        cmd = float(action[gripper_idx])
-        next_state = apply_binary_gripper_logic(
-            raw_val=cmd,
-            prev_binary_state=last_state,
-            open_threshold=open_threshold,
-            close_threshold=close_threshold,
-        )
-        if next_state != last_state:
-            penalty_value += float(penalty)
-    return np.asarray(penalty_value, dtype=np.float32)
-
-
 # ===========================================================================
 # Policy obs adapter
 # ===========================================================================
 class OpenArmPolicyObsAdapter:
-    """Convert base OpenArm observations into the policy observation space."""
+    """Replay the installed observation wrappers for externally sampled frames."""
 
-    def __init__(
-        self,
-        relative_wrapper=None,
-        quat_wrapper=None,
-        crop_wrapper=None,
-        serl_wrapper=None,
-        chunking_wrapper=None,
-    ):
-        self.relative_wrapper = relative_wrapper
-        self.quat_wrapper = quat_wrapper
-        self.crop_wrapper = crop_wrapper
-        self.serl_wrapper = serl_wrapper
-        self.chunking_wrapper = chunking_wrapper
+    def __init__(self, wrapped_env):
+        wrappers = []
+        current = wrapped_env
+        while hasattr(current, "env"):
+            wrappers.append(current)
+            current = current.env
+        self.wrappers = list(reversed(wrappers))
 
     def __call__(self, raw_obs):
         obs = raw_obs
-        if self.relative_wrapper is not None:
-            tcp_pose = np.asarray(obs["state"]["tcp_pose"])
-            self.relative_wrapper.left_transform = construct_adjoint_matrix(tcp_pose[0])
-            self.relative_wrapper.right_transform = construct_adjoint_matrix(tcp_pose[1])
-            obs = self.relative_wrapper.transform_observation(obs)
-        if self.quat_wrapper is not None:
-            obs = self.quat_wrapper.observation(obs)
-        if self.crop_wrapper is not None:
-            obs = self.crop_wrapper.observation(obs)
-        if self.serl_wrapper is not None:
-            obs = self.serl_wrapper.observation(obs)
-        if self.chunking_wrapper is not None:
-            self.chunking_wrapper.current_obs.append(obs)
-            obs = stack_obs(self.chunking_wrapper.current_obs)
+        for wrapper in self.wrappers:
+            external_transform = getattr(type(wrapper), "transform_external_observation", None)
+            if callable(external_transform):
+                obs = external_transform(wrapper, obs)
+            elif isinstance(wrapper, ChunkingWrapper):
+                wrapper.current_obs.append(obs)
+                obs = stack_obs(wrapper.current_obs)
+            elif isinstance(wrapper, gym.ObservationWrapper):
+                obs = wrapper.observation(obs)
         return obs
 
 
@@ -171,10 +131,14 @@ class DualRelativeFrame(gym.Wrapper):
         self.left_reset_inv = np.eye(4)
         self.right_reset_inv = np.eye(4)
 
+    def _update_twist_transforms(self, tcp_pose):
+        tcp_pose = np.asarray(tcp_pose)
+        self.left_transform = construct_twist_rotation_matrix(tcp_pose[0])
+        self.right_transform = construct_twist_rotation_matrix(tcp_pose[1])
+
     def _update_from_obs(self, obs):
         tcp_pose = np.asarray(obs["state"]["tcp_pose"])
-        self.left_transform = construct_adjoint_matrix(tcp_pose[0])
-        self.right_transform = construct_adjoint_matrix(tcp_pose[1])
+        self._update_twist_transforms(tcp_pose)
         if self.include_relative_pose:
             self.left_reset_inv = np.linalg.inv(construct_homogeneous_matrix(tcp_pose[0]))
             self.right_reset_inv = np.linalg.inv(construct_homogeneous_matrix(tcp_pose[1]))
@@ -194,13 +158,20 @@ class DualRelativeFrame(gym.Wrapper):
             },
         }
         tcp_vel = obs["state"]["tcp_vel"]
-        tcp_vel[0] = np.linalg.inv(self.left_transform) @ tcp_vel[0]
-        tcp_vel[1] = np.linalg.inv(self.right_transform) @ tcp_vel[1]
+        # These matrices contain rotations only, so transpose is the exact
+        # inverse and avoids a generic matrix inversion on every observation.
+        tcp_vel[0] = self.left_transform.T @ tcp_vel[0]
+        tcp_vel[1] = self.right_transform.T @ tcp_vel[1]
         if self.include_relative_pose:
             tcp_pose = obs["state"]["tcp_pose"]
             tcp_pose[0] = self._transform_pose(tcp_pose[0], self.left_reset_inv)
             tcp_pose[1] = self._transform_pose(tcp_pose[1], self.right_reset_inv)
         return obs
+
+    def transform_external_observation(self, obs):
+        tcp_pose = np.asarray(obs["state"]["tcp_pose"])
+        self._update_twist_transforms(tcp_pose)
+        return self.transform_observation(obs)
 
     def transform_action(self, action):
         action = np.asarray(action, dtype=np.float32).copy()
@@ -212,8 +183,8 @@ class DualRelativeFrame(gym.Wrapper):
     def transform_action_inv(self, action):
         action = np.asarray(action, dtype=np.float32).copy()
         if action.shape[0] >= 14:
-            action[:6] = np.linalg.inv(self.left_transform) @ action[:6]
-            action[7:13] = np.linalg.inv(self.right_transform) @ action[7:13]
+            action[:6] = self.left_transform.T @ action[:6]
+            action[7:13] = self.right_transform.T @ action[7:13]
         return action
 
     def reset(self, **kwargs):
@@ -224,11 +195,8 @@ class DualRelativeFrame(gym.Wrapper):
     def step(self, action):
         transformed_action = self.transform_action(action)
         obs, reward, done, truncated, info = self.env.step(transformed_action)
-        if "intervene_action" in info:
-            info["intervene_action"] = self.transform_action_inv(info["intervene_action"])
         tcp_pose = np.asarray(obs["state"]["tcp_pose"])
-        self.left_transform = construct_adjoint_matrix(tcp_pose[0])
-        self.right_transform = construct_adjoint_matrix(tcp_pose[1])
+        self._update_twist_transforms(tcp_pose)
         return self.transform_observation(obs), reward, done, truncated, info
 
 
@@ -301,47 +269,6 @@ class NetworkPrimaryImageCropWrapper(gym.ObservationWrapper):
 
 
 # ===========================================================================
-# GripperPenaltyWrapper
-# ===========================================================================
-class GripperPenaltyWrapper(gym.Wrapper):
-    """HIL-SERL-style learned-gripper penalty: prefer no-op over redundant open/close."""
-
-    def __init__(self, env, penalty=-0.02):
-        super().__init__(env)
-        self.penalty = float(penalty)
-        self.last_gripper_binary_state = np.zeros((2,), dtype=np.int32)
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        base_env = self.env.unwrapped
-        self.last_gripper_binary_state = np.asarray(
-            getattr(base_env, "gripper_binary_state", np.zeros((2,), dtype=np.int32)),
-            dtype=np.int32,
-        ).copy()
-        return obs, info
-
-    def step(self, action):
-        obs, reward, done, truncated, info = self.env.step(action)
-        effective_action = info.get("intervene_action", action) if isinstance(info, dict) else action
-        if not isinstance(info, dict):
-            info = {}
-        base_env = self.env.unwrapped
-        open_threshold, close_threshold = get_gripper_thresholds(base_env)
-        info["grasp_penalty"] = compute_grasp_penalty(
-            effective_action,
-            self.last_gripper_binary_state,
-            self.penalty,
-            open_threshold=open_threshold,
-            close_threshold=close_threshold,
-        )
-        self.last_gripper_binary_state = np.asarray(
-            getattr(base_env, "gripper_binary_state", self.last_gripper_binary_state),
-            dtype=np.int32,
-        ).copy()
-        return obs, reward, done, truncated, info
-
-
-# ===========================================================================
 # DualSpacemouseIntervention
 # ===========================================================================
 class DualSpacemouseIntervention(gym.ActionWrapper):
@@ -367,12 +294,6 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         ee_y="-y",
         ee_z="-z",
         control_hz=80.0,
-        servo_backend="analytic",
-        servo_hz=100.0,
-        servo_trans_step=0.004,
-        servo_rot_step=0.012,
-        servo_gripper_step=0.05,
-        transition_sample_delay=0.0,
         print_raw=False,
         policy_obs_adapter=None,
     ):
@@ -387,12 +308,9 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         self.ee_y = ee_y
         self.ee_z = ee_z
         self.control_hz = float(control_hz)
-        self.servo_backend = str(servo_backend)
-        self.servo_hz = float(servo_hz)
-        self.servo_trans_step = float(servo_trans_step)
-        self.servo_rot_step = float(servo_rot_step)
-        self.servo_gripper_step = float(servo_gripper_step)
-        self.transition_sample_delay = float(transition_sample_delay)
+        if not np.isfinite(self.control_hz) or self.control_hz <= 0.0:
+            raise ValueError(f"control_hz must be finite and positive, got {control_hz!r}")
+        self.control_dt = 1.0 / self.control_hz
         self.print_raw = bool(print_raw)
         self.policy_obs_adapter = policy_obs_adapter
 
@@ -415,14 +333,17 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
 
         self._left = self._make_device_state("left")
         self._right = self._make_device_state("right")
-        self._servo_running = False
         self._last_obs = None
         self._prev_obs_for_transition = None
         self._target_pose_ref = None
-        self._last_servo_mode = False
+        self._last_intervention_mode = False
         self._intervention_mode = False
         self._idle_hold_sent = False
         self._init_devices()
+
+    @property
+    def intervention_active(self):
+        return bool(self._intervention_mode)
 
     def _make_device_state(self, label):
         return {
@@ -433,6 +354,7 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             "dev": None,
             "enabled": False,
             "gripper_toggle_changed": False,
+            "relative_axes": set(),
         }
 
     def _sync_button_state_from_hardware(self):
@@ -571,52 +493,12 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             raise RuntimeError("DualSpacemouseIntervention requires a policy_obs_adapter")
         return self.policy_obs_adapter(raw_obs)
 
-    def _transform_action_to_base(self, action):
-        transformed = np.array(action, copy=True)
-        relative_wrapper = self._find_wrapper(self.env, DualRelativeFrame)
-        if relative_wrapper is not None:
-            transformed = relative_wrapper.transform_action(transformed)
-        return transformed
-
     def _transform_action_to_policy(self, action):
         transformed = np.array(action, copy=True)
         relative_wrapper = self._find_wrapper(self.env, DualRelativeFrame)
         if relative_wrapper is not None:
             transformed = relative_wrapper.transform_action_inv(transformed)
         return transformed
-
-    def _post_server_json(self, route, payload, timeout):
-        base_env = self.env.unwrapped
-        return base_env.session.post(base_env.url.rstrip("/") + route, json=payload, timeout=timeout)
-
-    def _start_servo(self):
-        if self._servo_running:
-            return
-        base_env = self.env.unwrapped
-        if self._target_pose_ref is None:
-            base_env.refresh_obs()
-            self._target_pose_ref = np.array(base_env.currpos, copy=True)
-        payload = {
-            "arr": np.asarray(self._target_pose_ref, dtype=np.float32).tolist(),
-            "gripper": [float(x) for x in base_env.curr_gripper_pos],
-            "servo_hz": self.servo_hz,
-            "trans_step": self.servo_trans_step,
-            "rot_step": self.servo_rot_step,
-            "gripper_step": self.servo_gripper_step,
-            "backend": self.servo_backend,
-        }
-        resp = self._post_server_json("/control/start", payload, timeout=3.0)
-        resp.raise_for_status()
-        self._servo_running = True
-
-    def _stop_servo(self):
-        if not self._servo_running:
-            return
-        try:
-            self._post_server_json("/control/stop", {}, timeout=2.0)
-        except Exception:
-            pass
-        self._servo_running = False
 
     def _build_hold_action(self):
         return np.array(
@@ -629,56 +511,44 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             dtype=np.float32,
         )
 
-    def _update_target_pose_ref(self, action):
+    def _update_target_pose_ref(self, base_action, dt):
         base_env = self.env.unwrapped
-        base_action = self._transform_action_to_base(action)
-        updated = np.array(self._target_pose_ref, copy=True)
-        for arm_idx in range(2):
-            arm_action = base_action[arm_idx * 7 : (arm_idx + 1) * 7]
-            updated[arm_idx, :3] += arm_action[:3] * base_env.action_scale[0]
-            rot_curr = R.from_quat(updated[arm_idx, 3:])
-            rot_delta = R.from_euler("xyz", arm_action[3:6] * base_env.action_scale[1])
-            updated[arm_idx, 3:] = (rot_delta * rot_curr).as_quat()
-        self._target_pose_ref = updated
+        self._target_pose_ref = base_env.clip_safety_box(
+            integrate_pose_velocity(
+                self._target_pose_ref,
+                base_action,
+                base_env.action_velocity_scale,
+                dt,
+            )
+        )
+        base_env.target_pose_ref = np.array(self._target_pose_ref, copy=True)
 
     def _update_servo_target(self, action):
         base_env = self.env.unwrapped
-        payload = {
-            "arr": np.asarray(self._target_pose_ref, dtype=np.float32).tolist(),
-            "gripper": base_env.gripper_actions_to_commands(action),
-        }
-        resp = self._post_server_json("/control/target", payload, timeout=2.0)
-        resp.raise_for_status()
+        base_env._send_pos_command(
+            self._target_pose_ref,
+            gripper_closed=base_env.gripper_actions_to_closed(action),
+        )
 
     def _sample_env_like_step(self, action):
         base_env = self.env.unwrapped
-        if self.transition_sample_delay > 0:
-            time.sleep(self.transition_sample_delay)
         raw_next_obs = base_env.refresh_obs()
         next_obs = self._transform_obs_to_policy_space(raw_next_obs)
+        base_env.curr_path_length += 1
+        truncated = bool(base_env.curr_path_length >= base_env.max_episode_length)
         # Reward comes from the outer classifier wrapper, not from teleop.
-        reward = np.asarray(0.0, dtype=np.float32)
-        done = False
-        truncated = False
         transition = {
             "observations": self._prev_obs_for_transition,
             "actions": np.array(action, copy=True),
             "next_observations": next_obs,
-            "rewards": reward,
-            "dones": done,
-            "truncated": truncated,
         }
         info = {
             "intervene_action": np.array(action, copy=True),
-            "intervention_mode": True,
-            "intervened": True,
-            "control_backend": self.servo_backend,
-            "transition_sample_delay": self.transition_sample_delay,
-            "sampled_transition": transition,
+            "intervention_transition": transition,
         }
         self._prev_obs_for_transition = next_obs
         self._last_obs = next_obs
-        return next_obs, reward, done, truncated, info
+        return next_obs, 0.0, False, truncated, info
 
     def _poll_one_device(self, state):
         if not state["enabled"] or state["dev"] is None:
@@ -698,15 +568,13 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
                 if axis is not None:
                     if event.type == ecodes.EV_REL:
                         state["axes"][axis] += float(event.value)
+                        state["relative_axes"].add(axis)
                     else:
                         state["axes"][axis] = float(event.value)
+                        state["relative_axes"].discard(axis)
             elif event.type == ecodes.EV_KEY and int(event.value) == 1:
                 if event.code in (ecodes.BTN_0, ecodes.BTN_LEFT):
-                    self._intervention_mode = not self._intervention_mode
-                    print(
-                        f"[DualSpacemouse:{state['label']}] intervention mode: "
-                        f"{'ON' if self._intervention_mode else 'OFF'}"
-                    )
+                    state["intervention_toggle_requested"] = True
                 elif event.code in (ecodes.BTN_1, ecodes.BTN_RIGHT):
                     state["button_state"]["gripper_close"] = not state["button_state"]["gripper_close"]
                     state["gripper_toggle_changed"] = True
@@ -737,11 +605,9 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
             dtype=np.float32,
         )
 
-    def _build_intervene_action(self, policy_action):
-        action = np.asarray(policy_action, dtype=np.float32).copy()
-        if action.shape[0] != 14:
-            action = np.zeros((14,), dtype=np.float32)
-        base_action = self._transform_action_to_base(action)
+    def _build_intervene_actions(self):
+        """Return the same human command in policy-local and world frames."""
+        base_action = np.zeros((14,), dtype=np.float32)
         left_motion = self._has_motion_input(self._left["axes"]) or self._left["gripper_toggle_changed"]
         right_motion = self._has_motion_input(self._right["axes"]) or self._right["gripper_toggle_changed"]
         if left_motion:
@@ -754,14 +620,90 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         else:
             base_action[7:13] = 0.0
             base_action[13] = 1.0 if self._right["button_state"]["gripper_close"] else -1.0
-        return self._transform_action_to_policy(base_action)
+        return self._transform_action_to_policy(base_action), base_action
+
+    def _poll_devices_once(self):
+        self._poll_one_device(self._left)
+        self._poll_one_device(self._right)
+        if consume_intervention_toggle_requests((self._left, self._right)):
+            self._intervention_mode = not self._intervention_mode
+            print(f"[DualSpacemouse] intervention mode: {'ON' if self._intervention_mode else 'OFF'}")
+
+    def _consume_relative_axes(self):
+        """Clear per-tick EV_REL deltas while preserving EV_ABS positions."""
+        for state in (self._left, self._right):
+            for axis in state["relative_axes"]:
+                state["axes"][axis] = 0.0
+
+    def _run_intervention_window(self, window_start):
+        """Update the servo at high rate and emit at most one policy transition."""
+        base_env = self.env.unwrapped
+        transition_dt = base_env.control_dt
+        window_end = window_start + transition_dt
+        integrated_policy_action = np.zeros((14,), dtype=np.float64)
+        final_grippers = self._build_hold_action()[[6, 13]]
+        had_input = False
+
+        while self._intervention_mode:
+            tick_start = time.monotonic()
+            remaining = window_end - tick_start
+            if remaining <= 0.0:
+                break
+            tick_dt = min(self.control_dt, remaining)
+            left_active = self._has_motion_input(self._left["axes"]) or self._left["gripper_toggle_changed"]
+            right_active = self._has_motion_input(self._right["axes"]) or self._right["gripper_toggle_changed"]
+
+            if left_active or right_active:
+                policy_action, base_action = self._build_intervene_actions()
+                self._update_target_pose_ref(base_action, tick_dt)
+                self._update_servo_target(policy_action)
+                self._idle_hold_sent = False
+                had_input = True
+            else:
+                base_action = self._build_hold_action()
+                policy_action = self._transform_action_to_policy(base_action)
+                if not self._idle_hold_sent:
+                    base_env.refresh_obs()
+                    self._target_pose_ref = np.array(base_env.currpos, copy=True)
+                    base_env.target_pose_ref = np.array(self._target_pose_ref, copy=True)
+                    self._update_servo_target(policy_action)
+                    self._idle_hold_sent = True
+
+            integrated_policy_action[:6] += policy_action[:6] * tick_dt
+            integrated_policy_action[7:13] += policy_action[7:13] * tick_dt
+            final_grippers = policy_action[[6, 13]]
+            self._consume_relative_axes()
+
+            time.sleep(max(0.0, tick_start + tick_dt - time.monotonic()))
+            if time.monotonic() >= window_end:
+                break
+            self._poll_devices_once()
+
+        time.sleep(max(0.0, window_end - time.monotonic()))
+        if not had_input:
+            raw_obs = base_env.refresh_obs()
+            self._last_obs = self._transform_obs_to_policy_space(raw_obs)
+            self._prev_obs_for_transition = self._last_obs
+            return self._last_obs, 0.0, False, False, {"intervention_idle": True}
+
+        aggregated_action = np.zeros((14,), dtype=np.float32)
+        aggregated_action[:6] = integrated_policy_action[:6] / transition_dt
+        aggregated_action[7:13] = integrated_policy_action[7:13] / transition_dt
+        aggregated_action[[6, 13]] = final_grippers
+        aggregated_action = np.clip(
+            aggregated_action,
+            self.action_space.low,
+            self.action_space.high,
+        )
+        if self.print_raw:
+            print(f"[DualSpacemouse] aggregated_action={np.round(aggregated_action, 4).tolist()}")
+        return self._sample_env_like_step(aggregated_action)
 
     def reset(self, **kwargs):
         for state in (self._left, self._right):
             for key in state["axes"]:
                 state["axes"][key] = 0.0
             state["gripper_toggle_changed"] = False
-        self._stop_servo()
         self._intervention_mode = False
         self._idle_hold_sent = False
         obs, info = self.env.reset(**kwargs)
@@ -771,86 +713,32 @@ class DualSpacemouseIntervention(gym.ActionWrapper):
         return obs, info
 
     def step(self, action):
-        loop_start = time.time()
-        left_got = self._poll_one_device(self._left)
-        right_got = self._poll_one_device(self._right)
-        if not left_got:
-            for key in self._left["axes"]:
-                self._left["axes"][key] = 0.0
-        if not right_got:
-            for key in self._right["axes"]:
-                self._right["axes"][key] = 0.0
+        loop_start = time.monotonic()
+        self._poll_devices_once()
 
-        if self._intervention_mode and (not self._last_servo_mode):
+        if self._intervention_mode and (not self._last_intervention_mode):
             self.env.unwrapped.refresh_obs()
             self._target_pose_ref = np.array(self.env.unwrapped.currpos, copy=True)
+            self.env.unwrapped.target_pose_ref = np.array(self._target_pose_ref, copy=True)
             self._sync_button_state_from_hardware()
             self._idle_hold_sent = False
             if self._prev_obs_for_transition is None:
                 self._prev_obs_for_transition = self._last_obs
 
         if self._intervention_mode:
-            left_active = self._has_motion_input(self._left["axes"]) or self._left["gripper_toggle_changed"]
-            right_active = self._has_motion_input(self._right["axes"]) or self._right["gripper_toggle_changed"]
-            if (not left_active) and (not right_active):
-                if not self._servo_running:
-                    self.env.unwrapped.refresh_obs()
-                    self._target_pose_ref = np.array(self.env.unwrapped.currpos, copy=True)
-                    self._start_servo()
-                hold_action = self._build_hold_action()
-                if (
-                    (not self._idle_hold_sent)
-                    or self._left["gripper_toggle_changed"]
-                    or self._right["gripper_toggle_changed"]
-                ):
-                    self.env.unwrapped.refresh_obs()
-                    self._target_pose_ref = np.array(self.env.unwrapped.currpos, copy=True)
-                    self._update_servo_target(hold_action)
-                    self._idle_hold_sent = True
-                idle_info = {
-                    "intervention_idle": True,
-                    "intervention_mode": True,
-                    "control_backend": self.servo_backend,
-                }
-                if self._last_obs is None:
-                    self._last_obs, _ = self.env.reset()
-                dt = time.time() - loop_start
-                time.sleep(max(0.0, (1.0 / self.control_hz) - dt))
-                self._last_servo_mode = True
-                return self._last_obs, 0.0, False, False, idle_info
-
-            chosen_action = self._build_intervene_action(action)
-            self._idle_hold_sent = False
-            if self.print_raw:
-                print(f"[DualSpacemouse] action={np.round(chosen_action, 4).tolist()}")
-            if not self._servo_running:
-                self.env.unwrapped.refresh_obs()
-                self._target_pose_ref = np.array(self.env.unwrapped.currpos, copy=True)
-                self._start_servo()
-            self._update_target_pose_ref(chosen_action)
-            self._update_servo_target(chosen_action)
-            obs, reward, done, truncated, info = self._sample_env_like_step(chosen_action)
-            dt = time.time() - loop_start
-            time.sleep(max(0.0, (1.0 / self.control_hz) - dt))
-            self._last_servo_mode = True
-            return obs, reward, done, truncated, info
-
-        if self._servo_running:
-            self.env.unwrapped.refresh_obs()
-            self._target_pose_ref = np.array(self.env.unwrapped.currpos, copy=True)
-            self._stop_servo()
-            self._idle_hold_sent = False
+            self._last_intervention_mode = True
+            return self._run_intervention_window(loop_start)
 
         obs, reward, done, truncated, info = self.env.step(
             np.asarray(action, dtype=np.float32)
         )
+        self._consume_relative_axes()
         self._last_obs = obs
         self._prev_obs_for_transition = obs
-        self._last_servo_mode = False
+        self._last_intervention_mode = False
         return obs, reward, done, truncated, info
 
     def close(self):
-        self._stop_servo()
         for state in (self._left, self._right):
             dev = state["dev"]
             if dev is not None:

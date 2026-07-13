@@ -1,7 +1,7 @@
 """Configurable USB camera backend for OpenArm deployments.
 
-The top/head camera may vary between robots. Keep the public camera contract
-small: get_data() returns one BGR frame, matching cv2.VideoCapture.
+The top/head camera may vary between robots. The public camera contract is
+read_rgb(), independent of the OpenCV backend's native BGR format.
 """
 
 import os
@@ -44,7 +44,7 @@ class USBCamera:
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open USB camera device {device_id}")
 
-    def get_data(self, viz=False):
+    def read_rgb(self, viz=False):
         ret, frame = self.cap.read()
         if not ret:
             return None
@@ -53,7 +53,7 @@ class USBCamera:
             cv2.imshow("USB Camera", frame)
             cv2.waitKey(1)
 
-        return frame
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def close(self):
         if hasattr(self, "cap") and self.cap.isOpened():

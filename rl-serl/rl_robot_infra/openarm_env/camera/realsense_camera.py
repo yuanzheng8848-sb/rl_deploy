@@ -39,7 +39,7 @@ class RealsenseCamera:
         self.color_image = None
         self.depth_image = None
 
-    def get_data(self, viz=False):
+    def _read_data(self, viz=False):
         start = time.perf_counter()
         data = [None, None]
         frames = self.pipeline.wait_for_frames()
@@ -83,6 +83,9 @@ class RealsenseCamera:
         self.k += 1
         return data
 
+    def read_rgb(self, viz=False):
+        return self._read_data(viz=viz)[0]
+
     def close(self):
         if hasattr(self, "pipeline"):
             self.pipeline.stop()
@@ -98,32 +101,3 @@ class RealsenseCamera:
 
     def get_rate(self):
         return self.rate
-
-
-class OpenCVCamera:
-    def __init__(self, device_id=0, width=640, height=480, fps=30, exposure=None):
-        self.cap = cv2.VideoCapture(device_id)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-        if exposure is not None:
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-            self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open video device {device_id}")
-
-    def get_data(self, viz=False):
-        ret, frame = self.cap.read()
-        if not ret:
-            return None
-        if viz:
-            cv2.imshow("OpenCV Camera", frame)
-            cv2.waitKey(1)
-        return frame
-
-    def close(self):
-        if hasattr(self, "cap") and self.cap.isOpened():
-            self.cap.release()
-
-    def __del__(self):
-        self.close()

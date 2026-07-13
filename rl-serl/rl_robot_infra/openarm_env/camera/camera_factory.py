@@ -38,9 +38,3 @@ def build_camera(name, cfg, virtual=False, mock_camera_cls=None):
         )
 
     raise ValueError(f"Unsupported camera type for {name}: {camera_type}")
-
-
-def camera_frame(data):
-    if isinstance(data, (list, tuple)):
-        return data[0] if data else None
-    return data

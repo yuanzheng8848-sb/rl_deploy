@@ -13,11 +13,11 @@ from gymnasium.wrappers import RecordEpisodeStatistics
 
 from openarm_env.envs.openarm_env import DefaultOpenArmConfig
 from openarm_env.envs.local_openarm_env import LocalOpenArmEnv
+from openarm_env.camera.local_camera import load_deployment_camera_config
 from openarm_env.envs.wrappers import (
     DualRelativeFrame,
     Quat2EulerWrapper,
     NetworkPrimaryImageCropWrapper,
-    GripperPenaltyWrapper,
     DualSpacemouseIntervention,
     OpenArmPolicyObsAdapter,
 )
@@ -51,11 +51,7 @@ DEFAULT_CLASSIFIER_CKPT = str(task_classifier_ckpt_dir("openarm_pickplace"))
 class EnvConfig(DefaultOpenArmConfig):
     """OpenArm bimanual env config: three local cameras."""
 
-    REALSENSE_CAMERAS = {
-        "image_primary": "local-head",
-        "image_left": "local-left",
-        "image_right": "local-right",
-    }
+    CAMERAS = load_deployment_camera_config()
 
 
 class TrainConfig(DefaultTrainingConfig):
@@ -69,7 +65,6 @@ class TrainConfig(DefaultTrainingConfig):
     network_crop_primary = True
     network_primary_crop_ratio = NETWORK_PRIMARY_CROP_RATIO
     network_primary_crop_y_offset = NETWORK_PRIMARY_CROP_Y_OFFSET
-    grasp_penalty = 0.0
 
     # Classifier configuration (used by both training and online RL)
     classifier_threshold = CLASSIFIER_THRESHOLD
@@ -85,36 +80,27 @@ class TrainConfig(DefaultTrainingConfig):
             env_mode=env_mode,
             hz=self.hz,
             config=EnvConfig(),
-            max_episode_length=self.max_traj_length,
+            max_episode_length=int(round(self.max_episode_seconds * self.hz)),
         )
 
-        relative_wrapper = DualRelativeFrame(env)
-        env = relative_wrapper
-        quat_wrapper = Quat2EulerWrapper(env)
-        env = quat_wrapper
-        crop_wrapper = None
+        env = DualRelativeFrame(env)
+        env = Quat2EulerWrapper(env)
         if self.network_crop_primary:
-            crop_wrapper = NetworkPrimaryImageCropWrapper(
+            env = NetworkPrimaryImageCropWrapper(
                 env,
                 crop_ratio=self.network_primary_crop_ratio,
                 y_offset_ratio=self.network_primary_crop_y_offset,
             )
-            env = crop_wrapper
-        serl_wrapper = SERLObsWrapper(env, proprio_keys=self.proprio_keys)
-        env = serl_wrapper
-        chunking_wrapper = ChunkingWrapper(env, obs_horizon=1, act_exec_horizon=None)
-        env = chunking_wrapper
-        env = GripperPenaltyWrapper(env, penalty=self.grasp_penalty)
+        env = SERLObsWrapper(env, proprio_keys=self.proprio_keys)
+        env = ChunkingWrapper(env, obs_horizon=1, act_exec_horizon=None)
 
         if env_mode == "real":
-            policy_obs_adapter = OpenArmPolicyObsAdapter(
-                relative_wrapper=relative_wrapper,
-                quat_wrapper=quat_wrapper,
-                crop_wrapper=crop_wrapper,
-                serl_wrapper=serl_wrapper,
-                chunking_wrapper=chunking_wrapper,
+            policy_obs_adapter = OpenArmPolicyObsAdapter(env)
+            env = DualSpacemouseIntervention(
+                env,
+                control_hz=self.teleop_control_hz,
+                policy_obs_adapter=policy_obs_adapter,
             )
-            env = DualSpacemouseIntervention(env, policy_obs_adapter=policy_obs_adapter)
 
         if classifier:
             # Load classifier and reward function from base class.

@@ -1,10 +1,8 @@
 """Gymnasium interface for the bimanual OpenArm environment."""
 
-import base64
 import time
 from typing import Dict, Literal
 
-import cv2
 import gymnasium as gym
 import numpy as np
 import requests
@@ -26,22 +24,18 @@ class DefaultOpenArmConfig:
     """Default OpenArm environment configuration."""
 
     SERVER_URL: str = "http://127.0.0.1:5000/"
-    REALSENSE_CAMERAS: Dict[str, str] = {}
+    CAMERAS: Dict[str, dict] = {}
 
-    TARGET_POSE: np.ndarray = np.zeros((6,))
-    REWARD_THRESHOLD: np.ndarray = np.zeros((6,))
-
-    ACTION_SCALE: np.ndarray = np.array([0.01, 0.05, 1.0])
-    RESET_POSE: np.ndarray = np.zeros((6,))
+    # Maximum Cartesian velocities for a normalized action of magnitude 1.
+    # Units: metres/second and radians/second.
+    ACTION_VELOCITY_SCALE: np.ndarray = np.array([0.05, 0.25])
+    VIRTUAL_RESET_POSE: np.ndarray = np.zeros((6,))
 
     ABS_POSE_LIMIT_HIGH: np.ndarray = np.array([0.5, 0.5, 0.8, 3.14, 3.14, 3.14])
     ABS_POSE_LIMIT_LOW: np.ndarray = np.array([-0.5, -0.5, 0.0, -3.14, -3.14, -3.14])
 
     GRIPPER_OPEN_THRESHOLD: float = -0.3
     GRIPPER_CLOSE_THRESHOLD: float = 0.3
-    SAFE_GRIPPER_OPEN_CMD: float = -1.0
-    SAFE_GRIPPER_CLOSE_CMD: float = 0.05
-
 
 def apply_binary_gripper_logic(
     raw_val: float,
@@ -57,8 +51,29 @@ def apply_binary_gripper_logic(
     return next_binary_state
 
 
-def binary_gripper_state_to_cmd(binary_state: int, open_cmd: float, close_cmd: float) -> float:
-    return float(close_cmd) if int(binary_state) == 1 else float(open_cmd)
+def integrate_pose_velocity(
+    pose: np.ndarray,
+    action: np.ndarray,
+    velocity_scale: np.ndarray,
+    dt: float,
+) -> np.ndarray:
+    """Integrate a normalized 14-D Cartesian velocity command for ``dt`` seconds."""
+    updated = np.asarray(pose, dtype=np.float32).reshape(2, 7).copy()
+    action = np.asarray(action, dtype=np.float32).reshape(14)
+    scale = np.asarray(velocity_scale, dtype=np.float32).reshape(2)
+    dt = float(dt)
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError(f"dt must be finite and positive, got {dt!r}")
+    for arm_idx in (0, 1):
+        arm_action = action[arm_idx * 7 : (arm_idx + 1) * 7]
+        updated[arm_idx, :3] += arm_action[:3] * scale[0] * dt
+        # Rotational actions are angular-vector components, matching tcp_vel.
+        # Integrate them with the SO(3) exponential map instead of interpreting
+        # them as sequential XYZ Euler rotations.
+        rot_delta = Rotation.from_rotvec(arm_action[3:6] * scale[1] * dt)
+        rot_curr = Rotation.from_quat(updated[arm_idx, 3:])
+        updated[arm_idx, 3:] = (rot_delta * rot_curr).as_quat()
+    return updated
 
 
 def get_gripper_thresholds(config_or_env):
@@ -79,7 +94,7 @@ def get_gripper_thresholds(config_or_env):
 class OpenArmEnv(gym.Env):
     def __init__(
         self,
-        hz=5,
+        hz=20,
         env_mode: EnvMode = "real",
         config: DefaultOpenArmConfig = None,
         max_episode_length=100,
@@ -87,7 +102,10 @@ class OpenArmEnv(gym.Env):
         if env_mode not in ("real", "virtual"):
             raise ValueError(f"env_mode must be 'real' or 'virtual', got {env_mode!r}")
 
-        self.hz = hz
+        self.hz = float(hz)
+        if not np.isfinite(self.hz) or self.hz <= 0.0:
+            raise ValueError(f"hz must be finite and positive, got {hz!r}")
+        self.control_dt = 1.0 / self.hz
         self.env_mode = env_mode
         self.is_virtual = env_mode == "virtual"
         self.config = config or DefaultOpenArmConfig()
@@ -97,7 +115,9 @@ class OpenArmEnv(gym.Env):
         self.session = None if self.is_virtual else requests.Session()
         self.url = self.config.SERVER_URL
 
-        self.action_scale = self.config.ACTION_SCALE
+        self.action_velocity_scale = np.asarray(
+            self.config.ACTION_VELOCITY_SCALE, dtype=np.float32
+        ).reshape(2)
 
         self.xyz_bounding_box = gym.spaces.Box(
             self.config.ABS_POSE_LIMIT_LOW[:3],
@@ -105,36 +125,36 @@ class OpenArmEnv(gym.Env):
             dtype=np.float64,
         )
 
-        single_arm_quat = euler_2_quat(self.config.RESET_POSE[3:])
-        single_arm_reset = np.concatenate([self.config.RESET_POSE[:3], single_arm_quat])
+        virtual_reset_pose = np.asarray(self.config.VIRTUAL_RESET_POSE, dtype=np.float32)
+        single_arm_quat = euler_2_quat(virtual_reset_pose[3:])
+        single_arm_reset = np.concatenate([virtual_reset_pose[:3], single_arm_quat])
         self.resetpos = np.vstack([single_arm_reset, single_arm_reset]).astype(np.float32)
 
         self.currpos = self.resetpos.copy()
+        self.target_pose_ref = self.currpos.copy()
         self.currvel = np.zeros((2, 6), dtype=np.float32)
         self._last_tcp_pose_for_vel = None
         self._last_tcp_pose_time = None
         self.state_stale = False
 
-        self.q = np.zeros((2, 7), dtype=np.float32)
-        self.dq = np.zeros((2, 7), dtype=np.float32)
-        self.curr_gripper_pos = np.zeros((2,), dtype=np.float32)
         self.gripper_binary_state = np.zeros((2,), dtype=int)
         self.gripper_open_threshold, self.gripper_close_threshold = get_gripper_thresholds(
             self.config
         )
-        self.safe_gripper_open_cmd = float(getattr(self.config, "SAFE_GRIPPER_OPEN_CMD", -1.0))
-        self.safe_gripper_close_cmd = float(getattr(self.config, "SAFE_GRIPPER_CLOSE_CMD", 0.05))
+        self.servo_running = False
+        self.control_backend = None
 
         self.curr_path_length = 0
         self.cycle_count = 0
         self.latest_images = {}
+        self._next_step_deadline = None
 
         tcp_shape = (2, 7)
         gripper_shape = (2, 1)
         action_dim = 14
         img_spaces = {
             name: gym.spaces.Box(0, 255, shape=(128, 128, 3), dtype=np.uint8)
-            for name in self.config.REALSENSE_CAMERAS.keys()
+            for name in self.config.CAMERAS.keys()
         }
         self.observation_space = gym.spaces.Dict(
             {
@@ -160,40 +180,24 @@ class OpenArmEnv(gym.Env):
             dtype=np.float32,
         )
 
-        if self.config.REALSENSE_CAMERAS:
-            self.init_cameras(self.config.REALSENSE_CAMERAS)
+        if self.config.CAMERAS:
+            self.init_cameras(self.config.CAMERAS)
 
         if self.is_virtual:
             print(f"Initialized OpenArm Env (virtual, offline) - Arm: {self.arm}")
         else:
             print(f"Initialized OpenArm Env (real) connected to {self.url} - Arm: {self.arm}")
 
-    def sync_binary_gripper_state_from_position(self):
-        current = np.asarray(self.curr_gripper_pos, dtype=np.float32).reshape(-1)
-        if current.size < 2:
-            return
-        updated = np.zeros((2,), dtype=np.int32)
-        for arm_idx in range(2):
-            pos = float(current[arm_idx])
-            dist_open = abs(pos - self.safe_gripper_open_cmd)
-            dist_close = abs(pos - self.safe_gripper_close_cmd)
-            updated[arm_idx] = 1 if dist_close <= dist_open else 0
-        self.gripper_binary_state = updated
-
-    def _apply_gripper_action(self, raw_val: float, arm_idx: int) -> float:
+    def _apply_gripper_action(self, raw_val: float, arm_idx: int) -> bool:
         self.gripper_binary_state[arm_idx] = apply_binary_gripper_logic(
             raw_val=raw_val,
             prev_binary_state=self.gripper_binary_state[arm_idx],
             open_threshold=self.gripper_open_threshold,
             close_threshold=self.gripper_close_threshold,
         )
-        return binary_gripper_state_to_cmd(
-            self.gripper_binary_state[arm_idx],
-            self.safe_gripper_open_cmd,
-            self.safe_gripper_close_cmd,
-        )
+        return bool(self.gripper_binary_state[arm_idx])
 
-    def gripper_actions_to_commands(self, action: np.ndarray) -> list:
+    def gripper_actions_to_closed(self, action: np.ndarray) -> list:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.size < 14:
             raise ValueError(f"Expected 14-dim action, got shape {action.shape}")
@@ -212,46 +216,47 @@ class OpenArmEnv(gym.Env):
         return clipped_pose
 
     def step(self, action: np.ndarray) -> tuple:
-        start_time = time.time()
+        now = time.monotonic()
+        if self._next_step_deadline is None:
+            step_deadline = now + self.control_dt
+        else:
+            step_deadline = self._next_step_deadline
+            while step_deadline <= now:
+                step_deadline += self.control_dt
         action = np.clip(
             np.asarray(action, dtype=np.float32),
             self.action_space.low,
             self.action_space.high,
         )
 
-        nextpos = self.currpos.copy()
-        for arm_idx in (0, 1):
-            idx_start = arm_idx * 7
-            current_arm_action = action[idx_start : idx_start + 7]
-            nextpos[arm_idx, :3] += current_arm_action[:3] * self.action_scale[0]
-            rpy_delta = current_arm_action[3:6] * self.action_scale[1]
-            rot_delta = Rotation.from_euler("xyz", rpy_delta)
-            rot_curr = Rotation.from_quat(nextpos[arm_idx, 3:])
-            nextpos[arm_idx, 3:] = (rot_delta * rot_curr).as_quat()
-
-        target_pos = self.clip_safety_box(nextpos)
-        final_gripper_cmds = self.gripper_actions_to_commands(action)
+        target_pos = self.clip_safety_box(
+            integrate_pose_velocity(
+                self.target_pose_ref,
+                action,
+                self.action_velocity_scale,
+                self.control_dt,
+            )
+        )
+        self.target_pose_ref = target_pos
+        gripper_closed = self.gripper_actions_to_closed(action)
         if self.is_virtual:
-            self._apply_virtual_target(target_pos, gripper_pos=final_gripper_cmds)
+            self._apply_virtual_target(target_pos, gripper_closed=gripper_closed)
         else:
-            self._send_pos_command(target_pos, gripper_pos=final_gripper_cmds)
+            self._send_pos_command(target_pos, gripper_closed=gripper_closed)
 
         self.curr_path_length += 1
-        dt = time.time() - start_time
-        time.sleep(max(0, (1.0 / self.hz) - dt))
+        time.sleep(max(0.0, step_deadline - time.monotonic()))
+        self._next_step_deadline = step_deadline + self.control_dt
 
         if not self.is_virtual:
             self._update_currpos()
 
         obs = self._get_obs()
-        reward = self.compute_reward(obs, False)
-        terminated = bool(reward == 1.0)
+        reward = 0.0
+        terminated = False
         truncated = bool(self.curr_path_length >= self.max_episode_length)
         info = {"state_stale": bool(self.state_stale)}
         return obs, reward, terminated, truncated, info
-
-    def compute_reward(self, obs: Dict, gripper_effective: bool) -> float:
-        return 0.0
 
     def _get_obs(self) -> dict:
         images = {}
@@ -281,19 +286,19 @@ class OpenArmEnv(gym.Env):
 
         if self.is_virtual:
             self.currpos = self.resetpos.copy()
-            self.curr_gripper_pos = np.array(
-                [self.safe_gripper_open_cmd, self.safe_gripper_open_cmd],
-                dtype=np.float32,
-            )
         else:
+            self.stop_control()
             self.go_to_rest()
 
         self.currvel = np.zeros((2, 6), dtype=np.float32)
         self._last_tcp_pose_for_vel = self.currpos.copy()
         self._last_tcp_pose_time = time.time()
+        self.target_pose_ref = self.currpos.copy()
+        self._next_step_deadline = None
         self.gripper_binary_state = np.zeros((2,), dtype=int)
+        if not self.is_virtual:
+            self.start_control()
 
-        self.sync_binary_gripper_state_from_position()
         self.initial_reset_pose = self.currpos.copy()
         return self._get_obs(), {}
 
@@ -309,12 +314,33 @@ class OpenArmEnv(gym.Env):
             print(f"[Env Warning] Joint reset failed: {exc}")
         self._update_currpos()
 
-    def _send_pos_command(self, pos: np.ndarray, gripper_pos: list = None):
+    def start_control(self):
+        if self.is_virtual or self.servo_running:
+            return
+        payload = {
+            "arr": np.asarray(self.currpos, dtype=np.float32).tolist(),
+            "gripper_closed": self.gripper_binary_state.astype(bool).tolist(),
+        }
+        resp = self.session.post(self.url + "control/start", json=payload, timeout=3.0)
+        resp.raise_for_status()
+        self.control_backend = resp.json()["backend"]
+        self.servo_running = True
+
+    def stop_control(self):
+        if self.is_virtual or not self.servo_running:
+            return
+        try:
+            self.session.post(self.url + "control/stop", json={}, timeout=2.0).raise_for_status()
+        finally:
+            self.servo_running = False
+            self.control_backend = None
+
+    def _send_pos_command(self, pos: np.ndarray, gripper_closed: list = None):
         if self.is_virtual:
             raise RuntimeError("virtual OpenArmEnv must not send robot commands")
         data = {"arr": np.asarray(pos, dtype=np.float32).tolist()}
-        if gripper_pos is not None:
-            data["gripper"] = [float(x) for x in gripper_pos]
+        if gripper_closed is not None:
+            data["gripper_closed"] = [bool(x) for x in gripper_closed]
         try:
             resp = self.session.post(self.url + "control/target", json=data, timeout=2.0)
             if resp.status_code != 200:
@@ -346,13 +372,12 @@ class OpenArmEnv(gym.Env):
         self._last_tcp_pose_for_vel = new_pose.copy()
         self._last_tcp_pose_time = now
 
-    def _apply_virtual_target(self, pos: np.ndarray, gripper_pos: list = None):
+    def _apply_virtual_target(self, pos: np.ndarray, gripper_closed: list = None):
         target = np.asarray(pos, dtype=np.float32).reshape(2, 7)
         self._update_tcp_velocity(target)
         self.currpos[:] = target
-        if gripper_pos is not None:
-            self.curr_gripper_pos = np.asarray(gripper_pos, dtype=np.float32).reshape(2)
-            self.sync_binary_gripper_state_from_position()
+        if gripper_closed is not None:
+            self.gripper_binary_state = np.asarray(gripper_closed, dtype=np.int32).reshape(2)
         self.state_stale = False
 
     def _update_currpos(self):
@@ -374,40 +399,21 @@ class OpenArmEnv(gym.Env):
                 self._update_tcp_velocity(new_pose)
                 self.currpos[:] = new_pose
 
-            if "q" in ps:
-                self.q[:] = ensure_shape(ps["q"], 7)
-            self.dq[:] = ensure_shape(ps.get("dq", [0] * 14), 7)
-            if "gripper_pos" in ps:
-                self.curr_gripper_pos = np.asarray(ps["gripper_pos"], dtype=np.float32)
-                self.sync_binary_gripper_state_from_position()
-
-            if "images" in ps:
-                for name, b64_str in ps["images"].items():
-                    try:
-                        img_bytes = base64.b64decode(b64_str)
-                        nparr = np.frombuffer(img_bytes, np.uint8)
-                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        img = cv2.resize(img, (128, 128))
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        key = None
-                        if name == "head":
-                            key = "image_primary"
-                        elif name == "left":
-                            key = "image_left"
-                        elif name == "right":
-                            key = "image_right"
-                        if key:
-                            self.latest_images[key] = img
-                    except Exception as exc:
-                        print(f"[Env Warning] Failed to decode image {name}: {exc}")
+            if "gripper_closed" in ps:
+                self.gripper_binary_state = np.asarray(
+                    ps["gripper_closed"], dtype=np.int32
+                ).reshape(2)
             self.state_stale = False
         except Exception as exc:
             self.state_stale = True
             print(f"[Env Error] Update state failed: {exc}")
 
     def init_cameras(self, cameras):
-        pass
+        raise NotImplementedError(
+            "OpenArmEnv is state/control-only; use LocalOpenArmEnv for configured cameras"
+        )
 
     def close(self):
         if self.session is not None:
+            self.stop_control()
             self.session.close()

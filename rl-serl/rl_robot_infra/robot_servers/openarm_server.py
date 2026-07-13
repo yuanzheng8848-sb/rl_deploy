@@ -1,36 +1,33 @@
 ﻿import os
 
-# This process only serves hardware/camera/IK requests and should never reserve
+# This process only serves robot state/control/IK requests and should never reserve
 # training GPU memory. Force all downstream frameworks (e.g. JAX) onto CPU.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-from sympy.printing.glsl import print_glsl
 import time
 import numpy as np
 import threading
 from pathlib import Path
 from flask import Flask, request, jsonify
-import cv2
-import base64
 from scipy.spatial.transform import Rotation
 import yaml
-
-from openarm_env.camera.camera_factory import build_camera, camera_frame
 
 # --- Paths ---
 
 # Server module location.
 # rl-serl/rl_robot_infra/robot_servers/openarm_server.py
-# OpenArm control, IK, camera, configs, and description now live under rl_robot_infra.
+# OpenArm control, IK, configs, and description live under rl_robot_infra.
 # parents: [0]=robot_servers [1]=rl_robot_infra [2]=rl-serl [3]=zy
 INFRA_ROOT = Path(__file__).resolve().parents[1]
+CONTROL_CONFIG_PATH = INFRA_ROOT / "openarm_configs" / "control.yaml"
 
 # --- Hardware controller ---
 
 # Real hardware only.
 print(">>> MODE: REAL HARDWARE <<<")
 from openarm_control.controller import OpenArmController as HardwareController
+from openarm_control.gripper import GripperCalibration
 
 # --- IK solver imports ---
 # Converts Gym Cartesian commands into controller joint commands.
@@ -58,31 +55,38 @@ class OpenArmServer:
         if IK_AVAILABLE:
             self._init_ik_and_viser()
 
-        # Locks protect hardware, camera, and servo state across Flask threads.
+        # Locks protect hardware and servo state across Flask threads.
         self.lock = threading.Lock()
-        self.camera_lock = threading.Lock()
         self.servo_lock = threading.Lock()
-        self.latest_frames = {}
         self.running = True
 
-        # Opt-in real-time servo state. Disabled by default to preserve training behavior.
+        with open(CONTROL_CONFIG_PATH, encoding="utf-8") as handle:
+            self.control_config = yaml.safe_load(handle) or {}
+        servo_config = self.control_config["servo"]
+        gripper_config = self.control_config["gripper"]
+        self.home_joint_position = np.asarray(
+            self.control_config["home"]["joint_position"], dtype=np.float64
+        ).reshape(14)
+        self.gripper_calibration = GripperCalibration.from_config(gripper_config)
+
+        # One explicit control session is owned by the environment client.
         self.servo_enabled = False
-        self.servo_hz = 80.0
-        self.servo_trans_step = 0.004
-        self.servo_rot_step = 0.012
-        self.servo_gripper_step = 0.02
-        self.servo_timeout = 0.25
+        self.servo_hz = float(servo_config["hz"])
+        self.servo_trans_step = float(servo_config["translation_step"])
+        self.servo_rot_step = float(servo_config["rotation_step"])
+        self.servo_gripper_step = float(servo_config["gripper_step"])
+        self.servo_timeout = float(servo_config["timeout"])
         self.servo_pos_epsilon = 5e-4
         self.servo_rot_epsilon = 1e-2
         self.servo_target_pose = None
         self.servo_target_gripper = None
         self.servo_last_update_ts = 0.0
         self.servo_active_arms = (0, 1)
-        self.servo_backend = "analytic"
+        self.servo_backend = str(servo_config["backend"]).lower()
         self.servo_debug = {
             "status": "idle",
             "last_error": "",
-            "last_backend": "baseik",
+            "last_backend": self.servo_backend,
             "last_active_arms": (0, 1),
             "last_target_pose": None,
             "last_current_pose": None,
@@ -98,12 +102,6 @@ class OpenArmServer:
         self.servo_thread = threading.Thread(target=self._servo_loop, daemon=True)
         self.servo_thread.start()
         
-        # Initialize Cameras
-        self.cameras = {}
-        self._init_cameras()
-        self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
-        self.camera_thread.start()
-
     def _init_ik_and_viser(self):
         """Initialize the IK solver and optional Viser visualization."""
         try:
@@ -199,33 +197,6 @@ class OpenArmServer:
         except Exception as e:
             print(f"[Server Warning] Analytic servo init failed: {e}")
             self.analytic_servo_ready = False
-
-    def _init_cameras(self):
-        """Initialize configured cameras."""
-        cfg_path = INFRA_ROOT / "openarm_configs" / "cameras.yaml"
-        with open(cfg_path) as f:
-            self.cam_configs = yaml.safe_load(f) or {}
-        
-        for name, cfg in self.cam_configs.items():
-            try:
-                print(f"Initializing Camera {name}...")
-                cam = build_camera(name, cfg, virtual=False)
-                self.cameras[name] = cam
-                self.latest_frames[name] = None
-                print(f"Initialized {name} camera.")
-            except Exception as e:
-                print(f"[Server Warning] Camera {name} init failed: {e}")
-
-    def _camera_loop(self):
-        """Background thread to read camera frames"""
-        print("Starting Camera Loop...")
-        while self.running:
-            for name, cam in self.cameras.items():
-                img = camera_frame(cam.get_data())
-                if img is not None:
-                    with self.camera_lock:
-                        self.latest_frames[name] = img
-            time.sleep(0.01)
 
     def _get_current_joint_and_gripper(self):
         with self.lock:
@@ -536,21 +507,22 @@ class OpenArmServer:
                     vis_joints[7:] = q_target[7:]
                 self.viser.update_joints(vis_joints)
 
+    def _gripper_target_from_closed(self, gripper_closed):
+        return self.gripper_calibration.target_from_closed(gripper_closed)
+
+    def _gripper_closed_from_position(self, gripper_position):
+        return self.gripper_calibration.update_from_position(gripper_position)
+
     def start_servo(
         self,
         target_pose_flat=None,
         gripper_pos=None,
-        servo_hz=80.0,
-        trans_step=0.004,
-        rot_step=0.012,
-        gripper_step=0.02,
         arm="both",
-        backend="analytic",
     ):
         if not self.ik_solver:
             print("[Server] Cannot start servo: No solver initialized.")
             return False
-        if backend == "analytic" and not self.analytic_servo_ready:
+        if self.servo_backend == "analytic" and not self.analytic_servo_ready:
             print("[Server] Cannot start analytic servo: backend not ready.")
             return False
 
@@ -575,18 +547,13 @@ class OpenArmServer:
 
         with self.servo_lock:
             self.servo_enabled = True
-            self.servo_hz = float(servo_hz)
-            self.servo_trans_step = float(trans_step)
-            self.servo_rot_step = float(rot_step)
-            self.servo_gripper_step = float(gripper_step)
             self.servo_target_pose = target_pose
             self.servo_target_gripper = target_gripper
             self.servo_last_update_ts = time.time()
             self.servo_active_arms = active_arms
-            self.servo_backend = str(backend).lower()
         self._update_servo_debug(
             status="servo_started",
-            backend=str(backend).lower(),
+            backend=self.servo_backend,
             active_arms=active_arms,
             target_pose=target_pose,
             target_gripper=target_gripper,
@@ -619,11 +586,10 @@ class OpenArmServer:
             self.servo_target_gripper = None
             self.servo_last_update_ts = 0.0
             self.servo_active_arms = (0, 1)
-            self.servo_backend = "analytic"
         return True
 
-    def get_state(self, include_images=True):
-        """Return robot state, including encoded images."""
+    def get_state(self):
+        """Return the hardware-neutral environment state contract."""
         rich_state = None
         with self.lock:
             # Read joint and gripper state.
@@ -636,18 +602,20 @@ class OpenArmServer:
         # Normalize missing values.
         if l_pos is None: l_pos = np.zeros(7)
         if r_pos is None: r_pos = np.zeros(7)
-        if not l_grip: l_grip = [0.0]
-        if not r_grip: r_grip = [0.0]
+        if np.asarray(l_grip).size == 0: l_grip = [0.0]
+        if np.asarray(r_grip).size == 0: r_grip = [0.0]
         
         # Concatenate joint positions into a 14-D vector.
         q = np.concatenate([l_pos, r_pos])
         
         # Pack gripper positions into a 2-D vector.
         gripper = np.array([l_grip[0], r_grip[0]])
+        gripper_closed = self._gripper_closed_from_position(gripper)
 
         # Compute end-effector pose with forward kinematics.
         # If IK is unavailable, keep pose as zeros and still return state data.
         pose = np.zeros(14)
+        pose[[6, 13]] = 1.0
         if self.ik_solver:
             # IK solver returns [w, qx, qy, qz, px, py, pz].
             # OpenArmEnv expects [px, py, pz, qx, qy, qz, qw].
@@ -659,59 +627,16 @@ class OpenArmServer:
                 pose[i*7+3 : i*7+6] = p[1:4] # Rot (quat xyz)
                 pose[i*7+6] = p[0]         # Rot (quat w)
 
-        if rich_state is not None:
-            state_dict = rich_state.to_dict()
-            dq = state_dict["dq"]
-            joint_torque = state_dict["joint_torque"]
-            joint_accel_est = state_dict["joint_accel_est"]
-            motor_temperature = state_dict["motor_temperature"]
-            motor_enabled = state_dict["motor_enabled"]
-        else:
-            dq = [0.0] * 14
-            joint_torque = [0.0] * 14
-            joint_accel_est = [0.0] * 14
-            motor_temperature = {"t_mos": [], "t_rotor": []}
-            motor_enabled = []
-        safety_status = (
-            self.controller.safety.last_status.to_dict()
-            if hasattr(self.controller, "safety")
-            else {"mode": "UNKNOWN", "ok_to_send": True, "speed_scale": 1.0, "reasons": []}
-        )
-
         response = {
             "pose": pose.tolist(),
-            "q": q.tolist(),
-            "gripper_pos": gripper.tolist(),
-            "vel": [0.0] * 12,     # Cartesian velocity placeholder.
-            "dq": dq,
-            "force": [0.0] * 6,
-            "torque": [0.0] * 6,
-            "joint_torque": joint_torque,
-            "joint_accel_est": joint_accel_est,
-            "motor_temperature": motor_temperature,
-            "motor_enabled": motor_enabled,
-            "safety_status": safety_status,
-            "servo_debug": self._jsonify_servo_debug(),
+            "gripper_closed": gripper_closed.tolist(),
+            "timestamp": float(rich_state.timestamp) if rich_state is not None else 0.0,
         }
         
         # Update Viser visualization.
         if self.viser:
             self.viser.update_joints(q)
 
-        # Encode latest camera frames.
-        encoded_images = {}
-        if include_images:
-            with self.camera_lock:
-                for name, frame in self.latest_frames.items():
-                    if frame is not None:
-                        try:
-                            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                            b64_str = base64.b64encode(buffer).decode('utf-8')
-                            encoded_images[name] = b64_str
-                        except Exception as e:
-                            print(f"[Server Error] Encode image {name} failed: {e}")
-
-        response["images"] = encoded_images
         return response
 
     def _jsonify_servo_debug(self):
@@ -736,20 +661,10 @@ server = OpenArmServer()
 
 # --- Flask routes ---
 
-@app.route("/getstate", methods=["POST"])
-def route_get_state():
-    try:
-        return jsonify(server.get_state(include_images=True))
-    except Exception as e:
-        print(f"[API Error] getstate: {e}")
-        return str(e), 500
-
-
 @app.route("/state", methods=["POST"])
 def route_state():
     try:
-        payload = request.get_json(silent=True) or {}
-        return jsonify(server.get_state(include_images=bool(payload.get("include_images", False))))
+        return jsonify(server.get_state())
     except Exception as e:
         print(f"[API Error] state: {e}")
         return str(e), 500
@@ -781,24 +696,13 @@ def route_control_start():
     try:
         payload = request.json or {}
         arr = payload.get("arr")
-        gripper = payload.get("gripper")
-        servo_hz = payload.get("servo_hz", 100.0)
-        trans_step = payload.get("trans_step", 0.004)
-        rot_step = payload.get("rot_step", 0.012)
-        gripper_step = payload.get("gripper_step", 0.05)
-        arm = payload.get("arm", "both")
-        backend = payload.get("backend", "analytic")
+        gripper_closed = payload.get("gripper_closed")
+        gripper = None if gripper_closed is None else server._gripper_target_from_closed(gripper_closed)
         if server.start_servo(
             arr,
             gripper_pos=gripper,
-            servo_hz=servo_hz,
-            trans_step=trans_step,
-            rot_step=rot_step,
-            gripper_step=gripper_step,
-            arm=arm,
-            backend=backend,
         ):
-            return jsonify({"ok": True}), 200
+            return jsonify({"ok": True, "backend": server.servo_backend}), 200
         return jsonify({"ok": False, "error": "control start failed"}), 500
     except Exception as e:
         print(f"[API Error] control/start: {e}")
@@ -811,7 +715,8 @@ def route_control_target():
         payload = request.json or {}
         arr = payload.get("arr")
         joints = payload.get("joints")
-        gripper = payload.get("gripper")
+        gripper_closed = payload.get("gripper_closed")
+        gripper = None if gripper_closed is None else server._gripper_target_from_closed(gripper_closed)
         if joints is not None:
             q_target = np.array(joints, dtype=np.float64).reshape(14)
             active_arms = (0, 1)
@@ -827,8 +732,7 @@ def route_control_target():
         if arr is None:
             return "Missing array", 400
         if not server.servo_enabled:
-            if not server.start_servo(arr, gripper_pos=gripper):
-                return "Servo Start Fail", 500
+            return jsonify({"ok": False, "error": "control session is not started"}), 409
         if server.update_servo_target(arr, gripper_pos=gripper):
             return jsonify({"ok": True}), 200
         return "Servo Not Enabled", 409
@@ -853,14 +757,12 @@ def route_control_stop():
 @app.route("/control/home", methods=["POST"])
 def route_control_home():
     try:
-        home_pos_l = [-0.166811, -0.497863, 0.635447, 1.499999, -0.627859, 0.507960, -0.168161]
-        home_pos_r = [0.166811, 0.497863, -0.635447, 1.499999, 0.627859, -0.507960, 0.168161]
-        home_pos = np.concatenate([home_pos_l, home_pos_r])
+        home_pos = server.home_joint_position
         payload = request.json or {}
         duration = float(payload.get("duration", 3.0))
-        gripper = payload.get("gripper")
-        servo_hz = float(payload.get("servo_hz", server.servo_hz))
-        dt = max(1.0 / servo_hz, 0.001)
+        gripper_closed = payload.get("gripper_closed", [False, False])
+        gripper = server._gripper_target_from_closed(gripper_closed)
+        dt = max(1.0 / server.servo_hz, 0.001)
         deadline = time.time() + max(duration, dt)
         server.stop_servo()
         last_info = {}

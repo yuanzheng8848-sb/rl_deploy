@@ -12,6 +12,6 @@ class MockCamera:
         self.fps = int(fps)
         print(f"[MockCamera] Initialized {self.width}x{self.height}@{self.fps}fps")
 
-    def get_data(self, viz=False):
+    def read_rgb(self, viz=False):
         img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        return [img, None]
+        return img
