@@ -2,12 +2,11 @@
 
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import yaml
 
-from openarm_control.hardware import OpenArmCanBus
 from openarm_control.safety import SafetyConfig, SafetyMonitor
 from openarm_control.trajectory import LatestTargetBuffer, ServoGains, ServoLimits, JointTrajectoryLimiter
 from openarm_control.types import CommandTarget, MITCommand, RobotState
@@ -90,18 +89,30 @@ def _split_command(command: MITCommand, start: int, stop: int) -> MITCommand:
 class OpenArmController:
     """High-level bimanual controller with state and joint-command APIs."""
 
-    def __init__(self, enable_left=True, enable_right=True, can_config_path=None, control_config_path=None):
+    def __init__(
+        self,
+        enable_left=True,
+        enable_right=True,
+        can_config_path=None,
+        control_config_path=None,
+        bus_factory: Optional[Callable] = None,
+    ):
         self.enable_left = bool(enable_left)
         self.enable_right = bool(enable_right)
         self.can_config = _load_can_config(can_config_path)
         self.left_arm = None
         self.right_arm = None
+        if bus_factory is None:
+            # Keep the native extension out of simulation and unit-test processes.
+            from openarm_control.hardware import OpenArmCanBus
+
+            bus_factory = OpenArmCanBus
         if self.enable_left:
             cfg = self.can_config["left"]
-            self.left_arm = OpenArmCanBus(cfg["interface"], bool(cfg.get("can_fd", False)), self.can_config["motors"])
+            self.left_arm = bus_factory(cfg["interface"], bool(cfg.get("can_fd", False)), self.can_config["motors"])
         if self.enable_right:
             cfg = self.can_config["right"]
-            self.right_arm = OpenArmCanBus(cfg["interface"], bool(cfg.get("can_fd", False)), self.can_config["motors"])
+            self.right_arm = bus_factory(cfg["interface"], bool(cfg.get("can_fd", False)), self.can_config["motors"])
 
         velocity_limits, effort_limits = _load_joint_limits()
         limits = ServoLimits(
